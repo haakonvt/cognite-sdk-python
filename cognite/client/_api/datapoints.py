@@ -1,10 +1,12 @@
+from pprint import pprint
 import copy
 import math
 import re as regexp
 from datetime import datetime
-from typing import *
+# from typing import *
+from typing import Any, Dict, List, Union, Tuple
 
-import cognite.client.utils._time
+from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms, granularity_unit_to_ms
 from cognite.client import utils
 from cognite.client._api.synthetic_time_series import SyntheticDatapointsAPI
 from cognite.client._api_client import APIClient
@@ -16,6 +18,7 @@ class DatapointsAPI(APIClient):
     _RESOURCE_PATH = "/timeseries/data"
 
     def __init__(self, *args, **kwargs):
+        print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
         super().__init__(*args, **kwargs)
         self._DPS_LIMIT_AGG = 10000
         self._DPS_LIMIT = 100000
@@ -25,10 +28,26 @@ class DatapointsAPI(APIClient):
             self._config, api_version=self._api_version, cognite_client=self._cognite_client
         )
 
-    def retrieve(
+    def retrieve_new(
         self,
         start: Union[int, str, datetime],
         end: Union[int, str, datetime],
+        id: Union[int, List[int], Dict[str, Union[int, List[str]]], List[Dict[str, Union[int, List[str]]]]] = None,
+        external_id: Union[
+            str, List[str], Dict[str, Union[int, List[str]]], List[Dict[str, Union[int, List[str]]]]
+        ] = None,
+        aggregates: List[str] = None,
+        granularity: str = None,
+        include_outside_points: bool = None,
+        limit: int = None,
+        ignore_unknown_ids: bool = False,
+    ) -> Union[None, Datapoints, DatapointsList]:
+        pass
+
+    def retrieve(
+        self,
+        start: Union[int, str, datetime],  # API accepts None
+        end: Union[int, str, datetime],  # API accepts None
         id: Union[int, List[int], Dict[str, Union[int, List[str]]], List[Dict[str, Union[int, List[str]]]]] = None,
         external_id: Union[
             str, List[str], Dict[str, Union[int, List[str]]], List[Dict[str, Union[int, List[str]]]]
@@ -152,7 +171,7 @@ class DatapointsAPI(APIClient):
                 >>> latest_abc = res[0][0]
                 >>> latest_def = res[1][0]
         """
-        before = cognite.client.utils._time.timestamp_to_ms(before) if before else None
+        before = timestamp_to_ms(before) if before else None
         all_ids = self._process_ids(id, external_id, wrap_ids=True)
         is_single_id = self._is_single_identifier(id, external_id)
         if before:
@@ -181,8 +200,8 @@ class DatapointsAPI(APIClient):
     ) -> Union[DatapointsList, List[DatapointsList]]:
         """Get datapoints for one or more time series
 
-        This method is different from get() in that you can specify different start times, end times, and granularities
-        for each requested time series.
+        This method is different from retrieve() in that you can specify different start times, end times, and granularities
+        for each requested time series. ?????
 
         Args:
             query (Union[DatapointsQuery, List[DatapointsQuery]): List of datapoint queries.
@@ -518,7 +537,7 @@ class DatapointsAPI(APIClient):
             np.arange(
                 df.index[0],
                 df.index[-1] + pd.Timedelta(microseconds=1),
-                pd.Timedelta(microseconds=cognite.client.utils._time.granularity_to_ms(granularity) * 1000),
+                pd.Timedelta(microseconds=granularity_to_ms(granularity) * 1000),
             ),
             copy=False,
         )
@@ -720,12 +739,12 @@ class DatapointsPoster:
 
         valid_datapoints = []
         if isinstance(datapoints[0], tuple):
-            valid_datapoints = [(cognite.client.utils._time.timestamp_to_ms(t), v) for t, v in datapoints]
+            valid_datapoints = [(timestamp_to_ms(t), v) for t, v in datapoints]
         elif isinstance(datapoints[0], dict):
             for dp in datapoints:
                 assert "timestamp" in dp, "A datapoint is missing the 'timestamp' key"
                 assert "value" in dp, "A datapoint is missing the 'value' key"
-                valid_datapoints.append((cognite.client.utils._time.timestamp_to_ms(dp["timestamp"]), dp["value"]))
+                valid_datapoints.append((timestamp_to_ms(dp["timestamp"]), dp["value"]))
         return valid_datapoints
 
     def _bin_datapoints(self, dps_object_list: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -781,8 +800,8 @@ class _DPTask:
     def __init__(
         self, client, start, end, ts_item, aggregates, granularity, include_outside_points, limit, ignore_unknown_ids
     ):
-        self.start = cognite.client.utils._time.timestamp_to_ms(start)
-        self.end = cognite.client.utils._time.timestamp_to_ms(end)
+        self.start = timestamp_to_ms(start)
+        self.end = timestamp_to_ms(end)
         self.aggregates = ts_item.get("aggregates") or aggregates
         self.ts_item = {k: v for k, v in ts_item.items() if k in ["id", "externalId"]}
         self.granularity = granularity
@@ -798,7 +817,7 @@ class _DPTask:
         self.point_after = Datapoints()
 
     def next_start_offset(self):
-        return cognite.client.utils._time.granularity_to_ms(self.granularity) if self.granularity else 1
+        return granularity_to_ms(self.granularity) if self.granularity else 1
 
     def store_partial_result(self, raw_data, start, end):
         expected_fields = self.aggregates or ["value"]
@@ -901,8 +920,8 @@ class DatapointsFetcher:
 
     def _preprocess_tasks(self, tasks: List[_DPTask]):
         for t in tasks:
-            new_start = cognite.client.utils._time.timestamp_to_ms(t.start)
-            new_end = cognite.client.utils._time.timestamp_to_ms(t.end)
+            new_start = timestamp_to_ms(t.start)
+            new_end = timestamp_to_ms(t.end)
             if t.aggregates:
                 new_start = self._align_with_granularity_unit(new_start, t.granularity)
                 new_end = self._align_with_granularity_unit(new_end, t.granularity)
@@ -929,7 +948,7 @@ class DatapointsFetcher:
             self._fetch_datapoints_for_remaining_queries(remaining_tasks_with_windows)
 
     def _fetch_dps_initial_and_return_remaining_tasks(self, task: _DPTask) -> List[Tuple[_DPTask, _DPWindow]]:
-        ndp_in_first_task, last_timestamp = self._get_datapoints(task, None, True)
+        ndp_in_first_task, last_timestamp = self._get_datapoints_for_window(task, None, True)
         if ndp_in_first_task < task.request_limit:
             return []
         remaining_user_limit = task.limit - ndp_in_first_task
@@ -939,14 +958,14 @@ class DatapointsFetcher:
 
     def _fetch_datapoints_for_remaining_queries(self, tasks_with_windows: List[Tuple[_DPTask, _DPWindow]]):
         tasks_summary = utils._concurrency.execute_tasks_concurrently(
-            self._get_datapoints_with_paging, tasks_with_windows, max_workers=self.client._config.max_workers
+            self._get_all_datapoints, tasks_with_windows, max_workers=self.client._config.max_workers
         )
         if tasks_summary.exceptions:
             raise tasks_summary.exceptions[0]
 
     @staticmethod
     def _align_with_granularity_unit(ts: int, granularity: str):
-        gms = cognite.client.utils._time.granularity_unit_to_ms(granularity)
+        gms = granularity_unit_to_ms(granularity)
         if ts % gms == 0:
             return ts
         return ts - (ts % gms) + gms
@@ -961,29 +980,36 @@ class DatapointsFetcher:
         if task.start >= task.end:
             return []
         count_granularity = "1d"
-        if task.granularity and cognite.client.utils._time.granularity_to_ms(
-            "1d"
-        ) < cognite.client.utils._time.granularity_to_ms(task.granularity):
-            count_granularity = task.granularity
+        if task.granularity:
+            if granularity_to_ms("1d") < granularity_to_ms(task.granularity):
+                count_granularity = task.granularity
         try:
             count_task = _DPTask(
                 self.client, task.start, task.end, {"id": id}, ["count"], count_granularity, False, None, False
             )
-            self._get_datapoints_with_paging(count_task, _DPWindow(task.start, task.end))
+            # print("Getting COUNT...")
+            self._get_all_datapoints(count_task, _DPWindow(task.start, task.end))
             res = count_task.result()
+            # import pandas as pd
+            # with pd.option_context("display.max_rows", None):
+            #     print(res.to_pandas())
+            # input("...")
         except CogniteAPIError:
             res = []
         if len(res) == 0:  # string based series or aggregates not yet calculated
             return [_DPWindow(task.start, task.end, remaining_user_limit)]
         counts = list(zip(res.timestamp, res.count))
+        # pprint(counts)
         windows = []
         total_count = 0
         current_window_count = 0
         window_start = task.start
-        granularity_ms = cognite.client.utils._time.granularity_to_ms(task.granularity) if task.granularity else None
-        agg_count = lambda count: int(
-            min(math.ceil(cognite.client.utils._time.granularity_to_ms(count_granularity) / granularity_ms), count)
-        )
+        granularity_ms = granularity_to_ms(task.granularity) if task.granularity else None
+
+        def agg_count(count):
+            n = math.ceil(granularity_to_ms(count_granularity) / granularity_ms)
+            return int(min(n, count))
+
         for i, (ts, count) in enumerate(counts):
             if ts < task.start:  # API rounds time stamps down, so some of the first day may have been retrieved already
                 count = 0
@@ -991,11 +1017,20 @@ class DatapointsFetcher:
             if i < len(counts) - 1:
                 next_timestamp = counts[i + 1][0]
                 next_raw_count = counts[i + 1][1]
-                next_count = next_raw_count if task.granularity is None else agg_count(next_raw_count)
+                # next_count = next_raw_count if task.granularity is None else agg_count(next_raw_count)
+                if task.granularity is None:
+                    next_count = next_raw_count
+                else:
+                    next_count = agg_count(next_raw_count)
             else:
                 next_timestamp = task.end
                 next_count = 0
-            current_count = count if task.granularity is None else agg_count(count)
+            # current_count = count if task.granularity is None else agg_count(count)
+            if task.granularity is None:
+                current_count = count
+            else:
+                current_count = agg_count(count)
+
             total_count += current_count
             current_window_count += current_count
             if current_window_count + next_count > task.request_limit or i == len(counts) - 1:
@@ -1011,21 +1046,21 @@ class DatapointsFetcher:
 
     @staticmethod
     def _align_window_end(start: int, end: int, granularity: str):
-        gms = cognite.client.utils._time.granularity_to_ms(granularity)
+        gms = granularity_to_ms(granularity)
         diff = end - start
         end -= diff % gms
         return end
 
-    def _get_datapoints_with_paging(self, task, window):
+    def _get_all_datapoints(self, task, window):
         ndp_retrieved_total = 0
         while window.end > window.start and ndp_retrieved_total < window.limit:
-            ndp_retrieved, last_time = self._get_datapoints(task, window)
+            ndp_retrieved, last_time = self._get_datapoints_for_window(task, window)
             if ndp_retrieved < min(window.limit, task.request_limit):
                 break
             window.limit -= ndp_retrieved
             window.start = last_time + task.next_start_offset()
 
-    def _get_datapoints(
+    def _get_datapoints_for_window(
         self, task: _DPTask, window: _DPWindow = None, first_page: bool = False
     ) -> Tuple[int, Union[None, int]]:
         window = window or _DPWindow(task.start, task.end, task.limit)
@@ -1039,6 +1074,7 @@ class DatapointsFetcher:
             "ignoreUnknownIds": task.ignore_unknown_ids,
             "limit": min(window.limit, task.request_limit),
         }
+        # pprint(payload)
         res = self.client._post(self.client._RESOURCE_PATH + "/list", json=payload).json()["items"]
         if not res and task.ignore_unknown_ids:
             return task.mark_missing()
@@ -1050,14 +1086,14 @@ class DatapointsFetcher:
         is_list = False
         items = []
 
-        if isinstance(ids, List):
+        if isinstance(ids, list):
             is_list = True
             for item in ids:
                 items.append(DatapointsFetcher._process_single_ts_item(item, False))
         elif ids is not None:
             items.append(DatapointsFetcher._process_single_ts_item(ids, False))
 
-        if isinstance(external_ids, List):
+        if isinstance(external_ids, list):
             is_list = True
             for item in external_ids:
                 items.append(DatapointsFetcher._process_single_ts_item(item, True))
@@ -1072,7 +1108,7 @@ class DatapointsFetcher:
         id_type = str if external else int
         if isinstance(item, id_type):
             return {item_type: item}
-        elif isinstance(item, Dict):
+        elif isinstance(item, dict):
             for key in item:
                 if key not in [item_type, "aggregates"]:
                     raise ValueError("Unknown key '{}' in {} dict argument".format(key, item_type))
