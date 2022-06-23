@@ -4,7 +4,7 @@ import math
 import re as regexp
 from datetime import datetime
 # from typing import *
-from typing import Any, Dict, List, Union, Tuple
+from typing import Any, Dict, List, Union, Tuple, Union
 
 from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms, granularity_unit_to_ms
 from cognite.client import utils
@@ -19,6 +19,7 @@ class DatapointsAPI(APIClient):
 
     def __init__(self, *args, **kwargs):
         print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
+        print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
         super().__init__(*args, **kwargs)
         self._DPS_LIMIT_AGG = 10000
         self._DPS_LIMIT = 100000
@@ -30,11 +31,11 @@ class DatapointsAPI(APIClient):
 
     def retrieve_new(
         self,
-        start: Union[int, str, datetime],
-        end: Union[int, str, datetime],
+        start: Union[int, str, datetime] = None,  # TODO(haakonvt): Update docstring
+        end: Union[int, str, datetime] = None,  # TODO(haakonvt): Update docstring
         id: Union[int, List[int], Dict[str, Union[int, List[str]]], List[Dict[str, Union[int, List[str]]]]] = None,
         external_id: Union[
-            str, List[str], Dict[str, Union[int, List[str]]], List[Dict[str, Union[int, List[str]]]]
+            str, List[str], Dict[str, Union[str, List[str]]], List[Dict[str, Union[str, List[str]]]]
         ] = None,
         aggregates: List[str] = None,
         granularity: str = None,
@@ -42,15 +43,27 @@ class DatapointsAPI(APIClient):
         limit: int = None,
         ignore_unknown_ids: bool = False,
     ) -> Union[None, Datapoints, DatapointsList]:
-        pass
+        from cognite.client._api.datapoints_new import dps_new
+        query = DatapointsQuery(
+            start=start,
+            end=end,
+            id=id,
+            external_id=external_id,
+            aggregates=aggregates,
+            granularity=granularity,
+            include_outside_points=include_outside_points,
+            limit=limit,
+            ignore_unknown_ids=ignore_unknown_ids,
+        )
+        return dps_new(query)
 
     def retrieve(
         self,
-        start: Union[int, str, datetime],  # API accepts None
-        end: Union[int, str, datetime],  # API accepts None
+        start: Union[int, str, datetime],  # TODO(haakonvt): API accepts None
+        end: Union[int, str, datetime],  # TODO(haakonvt): API accepts None
         id: Union[int, List[int], Dict[str, Union[int, List[str]]], List[Dict[str, Union[int, List[str]]]]] = None,
         external_id: Union[
-            str, List[str], Dict[str, Union[int, List[str]]], List[Dict[str, Union[int, List[str]]]]
+            str, List[str], Dict[str, Union[str, List[str]]], List[Dict[str, Union[str, List[str]]]]
         ] = None,
         aggregates: List[str] = None,
         granularity: str = None,
@@ -92,7 +105,7 @@ class DatapointsAPI(APIClient):
 
                 >>> from cognite.client import CogniteClient
                 >>> c = CogniteClient()
-                >>> dps = c.datapoints.retrieve(external_id=["abc", "def"],
+                >>> c.datapoints.retrieve(external_id=["abc", "def"],
                 ...                         start=datetime(2018,1,1),
                 ...                         end=datetime(2019,1,1),
                 ...                         aggregates=["average"],
