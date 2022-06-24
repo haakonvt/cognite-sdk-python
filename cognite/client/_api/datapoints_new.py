@@ -1,12 +1,15 @@
+from __future__ import annotations
 from pprint import pprint
 import numbers
 from typing import List, Union, Optional, Dict, NoReturn
 from datetime import datetime
-from dataclasses import dataclass, fields
+import dataclasses
+from dataclasses import dataclass
 
 from cognite.client.data_classes import DatapointsQuery
-from cognite.client.utils._auxiliary import to_snake_case, to_camel_case
+from cognite.client.utils._auxiliary import to_camel_case
 
+print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
 
 
@@ -18,62 +21,7 @@ class NewDatapointsQuery(DatapointsQuery):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.all_queries = self.validate_and_create_queries()
-
-        """
-        self.id = id
-        self.external_id = external_id
-        self.start = start
-        self.end = end
-        self.limit = limit
-        self.aggregates = aggregates
-        self.granularity = granularity
-        self.include_outside_points = include_outside_points
-        self.ignore_unknown_ids = ignore_unknown_ids
-
-        # ID
-        int,  12345
-        List[int], [123, 345]
-        Dict[str, Any]
-        List[Union[int, Dict[str, Any]]]
-
-        # XID
-        str,
-        List[str],
-        Dict[str, Any]
-        List[Union[str, Dict[str, Any]]]
-
-        {'aggregates': ['average'],
-         'end': 0,
-         'granularity': '1h',
-         'ignoreUnknownIds': False,
-         'includeOutsidePoints': False,
-         'items': [{'aggregates': ['average'],
-                    'end': 0,
-                    'granularity': '1h',
-                    'id': 1,
-                    'includeOutsidePoints': False,
-                    'limit': 0,
-                    'start': 0}],
-         'limit': 100,
-         'start': 0}
-
-        client.datapoints.retrieve(
-            id=[
-                {"id": 1, "aggregates": ["average"]},
-                {"id": 1, "aggregates": ["min"]}
-            ],
-            external_id={
-                "externalId": "1", "aggregates": ["max"]
-            },
-            start="1d-ago",
-            end="now",
-            granularity="1h"
-        )
-        """
-
-    def validate_and_create_queries(self):
-        defaults = dict(
+        self.defaults = dict(
             start=self.start,
             end=self.end,
             limit=self.limit,
@@ -81,23 +29,40 @@ class NewDatapointsQuery(DatapointsQuery):
             granularity=self.granularity,
             include_outside_points=self.include_outside_points,
         )
+        self.all_queries = self.validate_and_create_queries()
+
+    def validate_and_create_queries(self):
         all_queries = []
         if self.id is not None:
             all_queries.extend(
                 self._validate_id_or_xid(
-                    id_or_xid=self.id, is_external_id=False, defaults=defaults,
+                    id_or_xid=self.id, is_external_id=False, defaults=self.defaults,
                 )
             )
         if self.external_id is not None:
             all_queries.extend(
                 self._validate_id_or_xid(
-                    id_or_xid=self.external_id, is_external_id=True, defaults=defaults,
+                    id_or_xid=self.external_id, is_external_id=True, defaults=self.defaults,
                 )
             )
-        return all_queries
+        if not all_queries:
+            raise ValueError("Pass at least one time series `id` or `external_id`!")
+        return self._split_queries_into_single_aggs(all_queries)
 
     @staticmethod
-    def _validate_id_or_xid(id_or_xid, is_external_id: bool, defaults: Dict):
+    def _split_queries_into_single_aggs(queries):
+        final_queries = []
+        for q in queries:
+            if isinstance(q.aggregates, list) and len(q.aggregates) > 1:
+                for agg in q.aggregates:
+                    q_new = SingleTSQuery(**dataclasses.asdict(q))
+                    q_new.aggregates = [agg]
+                    final_queries.append(q_new)
+            else:
+                final_queries.append(q)
+        return final_queries
+
+    def _validate_id_or_xid(self, id_or_xid, is_external_id: bool, defaults: Dict):
         if is_external_id:
             arg_name, exp_type = "external_id", str
         else:
@@ -107,19 +72,20 @@ class NewDatapointsQuery(DatapointsQuery):
             id_or_xid = [id_or_xid]
 
         if not isinstance(id_or_xid, list):
-            NewDatapointsQuery._raise_on_wrong_ts_identifier_type(id_or_xid, arg_name, exp_type)
+            self._raise_on_wrong_ts_identifier_type(id_or_xid, arg_name, exp_type)
         single_ts_queries = []
         for ts in id_or_xid:
             if isinstance(ts, exp_type):
-                single_ts_queries.append(SingleTSQuery(**{**defaults, arg_name: ts}))
-
+                single_ts_queries.extend(
+                    SingleTSQuery.create_multiple_from_dicts({arg_name: ts}, defaults=self.defaults)
+                )
             elif isinstance(ts, dict):
                 # Note: merge 'defaults' and given ts-dict; ts-dict takes precedence:
                 ts_dct = {**defaults, **ts}
-                NewDatapointsQuery._validate_ts_query_dct(ts_dct, arg_name, exp_type)
+                self._validate_ts_query_dct(ts_dct, arg_name, exp_type)
                 single_ts_queries.append(SingleTSQuery(**ts_dct))
             else:
-                NewDatapointsQuery._raise_on_wrong_ts_identifier_type(ts, arg_name, exp_type)
+                self._raise_on_wrong_ts_identifier_type(ts, arg_name, exp_type)
         return single_ts_queries
 
     @staticmethod
@@ -133,7 +99,8 @@ class NewDatapointsQuery(DatapointsQuery):
     def _validate_ts_query_dct(dct, arg_name, exp_type):
         if arg_name not in dct:
             if to_camel_case(arg_name) in dct:
-                # For backwards compatability:
+                # For backwards compatability we accept identifier in camel case:
+                dct = dct.copy()  # Avoid side effects
                 dct[arg_name] = dct.pop(to_camel_case(arg_name))
             else:
                 raise KeyError(f"Missing key `{arg_name}` in dict passed as, or part of argument `{arg_name}`")
@@ -162,11 +129,25 @@ class SingleTSQuery:
     include_outside_points: Optional[bool] = None
     limit: Optional[int] = None
 
+    @classmethod
+    def create_multiple_from_dicts(cls, ts_dct, defaults) -> List[SingleTSQuery]:
+        agg = ts_dct.get("aggregates") or defaults["aggregates"]
+        gran = ts_dct.get("granularity") or defaults["granularity"]
+
+    def validate(self):
+        if self.aggregates is None:
+            if self.granularity is not None:
+                # TODO(haakonvt): What if granularity comes from 'defaults'?
+                raise ValueError(
+                    "When supplying granularity, you must also specify aggregates. "
+                    f"Failed datapoints query: {dataclasses.asdict(self)}"
+                )
+
     def __repr__(self):
         # TODO(haakonvt): REMOVE
         s = ", ".join(
             f'{field.name}={getattr(self, field.name)!r}'
-            for field in fields(self)
+            for field in dataclasses.fields(self)
             if getattr(self, field.name) is not None
         )
         return f'{type(self).__name__}({s})'
@@ -181,23 +162,25 @@ if __name__ == "__main__":
     # Specify the aggregates to return. Use default if null.
     # If the default is a set of aggregates,
     # specify an empty string to get raw data.
-    START = 0
-    END = 100
+    START = None
+    END = None
     AGGREGATES = ["count"]
     GRANULARITY = "4d"
-    INCLUDE_OUTSIDE_POINTS = False
-    LIMIT = 50
+    INCLUDE_OUTSIDE_POINTS = None
+    LIMIT = None
     IGNORE_UNKNOWN_IDS = False
+    # ID = None
     ID = [
         12345678,
-        {"id": 123, "include_outside_points": not INCLUDE_OUTSIDE_POINTS, "aggregates": ""},
+        {"id": 123, "aggregates": ["count", "average"]},
     ]
     EXTERNAL_ID = [
-        "xiiiiiiid",
-        {"external_id": "asdf"},
-        {"externalId": "ASDF", "limit": -1, "granularity": "8h"},
-        None
+        # "xiiiiiiid",
+        # {"external_id": "asdf"},
+        # {"externalId": "ASDF", "limit": -1, "granularity": "8h"},
+        # None,
     ]
+    EXTERNAL_ID = None
 
     query = NewDatapointsQuery(
         start=START,
@@ -210,4 +193,5 @@ if __name__ == "__main__":
         limit=LIMIT,
         ignore_unknown_ids=IGNORE_UNKNOWN_IDS,
     )
-    pprint(query.all_queries)
+    q = query.all_queries
+    pprint(q)
