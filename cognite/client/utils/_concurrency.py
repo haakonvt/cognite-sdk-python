@@ -122,6 +122,7 @@ def execute_tasks_concurrently(func: Callable, tasks: Union[List[Tuple], List[Di
         unknown_result_tasks = []
         results = []
         exceptions = []
+        # TODO(haakonvt): as_completed? Need a special `execute_tasks_concurrently` for dataponits imo
         for i, f in enumerate(futures):
             try:
                 res = f.result()

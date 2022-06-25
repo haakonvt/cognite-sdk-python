@@ -77,7 +77,7 @@ class NewDatapointsQuery(DatapointsQuery):
         for ts in id_or_xid:
             if isinstance(ts, exp_type):
                 single_ts_queries.extend(
-                    SingleTSQuery.create_multiple_from_dicts({arg_name: ts}, defaults=self.defaults)
+                    SingleTSQuery.parse_multiple_to_list({arg_name: ts}, defaults=self.defaults)
                 )
             elif isinstance(ts, dict):
                 # Note: merge 'defaults' and given ts-dict; ts-dict takes precedence:
@@ -122,17 +122,40 @@ class NewDatapointsQuery(DatapointsQuery):
 class SingleTSQuery:
     id: Optional[int] = None
     external_id: Optional[str] = None
-    start: Union[int, str, datetime] = None
-    end: Union[int, str, datetime] = None
-    aggregates: Optional[List[str]] = None
+    start: Union[int, str, datetime, None] = None
+    end: Union[int, str, datetime, None] = None
     granularity: Optional[str] = None
     include_outside_points: Optional[bool] = None
     limit: Optional[int] = None
+    # Note `agg`: Only notable difference from regular query,
+    # enforcing exactly 0 or 1 aggregate.
+    agg: Optional[str] = None
 
     @classmethod
-    def create_multiple_from_dicts(cls, ts_dct, defaults) -> List[SingleTSQuery]:
-        agg = ts_dct.get("aggregates") or defaults["aggregates"]
-        gran = ts_dct.get("granularity") or defaults["granularity"]
+    def parse_multiple_to_list(cls, ts_dct, defaults) -> List[SingleTSQuery]:
+        # Note: We merge 'defaults' and given ts-dict, ts-dict takes precedence:
+        dct = {**defaults, **ts_dct}
+        granularity, aggregates = dct["granularity"], dct.pop("aggregates")
+
+        if not (granularity is None or isinstance(granularity, str)):
+            raise TypeError(f"Expected `granularity` to be of type `str` or None, not {type(granularity)}")
+
+        elif not (aggregates is None or isinstance(aggregates, list)):
+            raise TypeError(f"Expected `aggregates` to be of type `list[str]` or None, not {type(aggregates)}")
+
+        elif aggregates is None:
+            if granularity is None:
+                return cls(**dct, agg=aggregates)
+            raise KeyError(f"When passing `granularity`, argument `aggregates` is also required.")
+
+        # Aggregates must be a list at this point:
+        elif len(aggregates) == 0:
+            raise ValueError("Empty list of `aggregates` passed, expected at least one!")
+
+        elif granularity is None:
+            raise KeyError(f"When passing `aggregates`, argument `granularity` is also required.")
+        return [cls(**dct, agg=agg) for agg in aggregates]
+
 
     def validate(self):
         if self.aggregates is None:
