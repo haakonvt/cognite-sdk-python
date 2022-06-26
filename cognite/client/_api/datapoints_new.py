@@ -2,6 +2,7 @@ from __future__ import annotations
 from pprint import pprint
 import numbers
 from typing import List, Union, Optional, Dict, NoReturn
+from functools import partial, cached_property
 from datetime import datetime
 import dataclasses
 from dataclasses import dataclass
@@ -29,9 +30,12 @@ class NewDatapointsQuery(DatapointsQuery):
             granularity=self.granularity,
             include_outside_points=self.include_outside_points,
         )
-        self.all_queries = self.validate_and_create_queries()
 
-    def validate_and_create_queries(self):
+    @cached_property  # TODO: 3.8 feature
+    def all_queries(self):
+        return self._validate_and_create_queries()
+
+    def _validate_and_create_queries(self):
         all_queries = []
         if self.id is not None:
             all_queries.extend(
@@ -45,22 +49,9 @@ class NewDatapointsQuery(DatapointsQuery):
                     id_or_xid=self.external_id, is_external_id=True, defaults=self.defaults,
                 )
             )
-        if not all_queries:
-            raise ValueError("Pass at least one time series `id` or `external_id`!")
-        return self._split_queries_into_single_aggs(all_queries)
-
-    @staticmethod
-    def _split_queries_into_single_aggs(queries):
-        final_queries = []
-        for q in queries:
-            if isinstance(q.aggregates, list) and len(q.aggregates) > 1:
-                for agg in q.aggregates:
-                    q_new = SingleTSQuery(**dataclasses.asdict(q))
-                    q_new.aggregates = [agg]
-                    final_queries.append(q_new)
-            else:
-                final_queries.append(q)
-        return final_queries
+        if all_queries:
+            return all_queries
+        raise ValueError("Pass at least one time series `id` or `external_id`!")
 
     def _validate_id_or_xid(self, id_or_xid, is_external_id: bool, defaults: Dict):
         if is_external_id:
@@ -73,26 +64,25 @@ class NewDatapointsQuery(DatapointsQuery):
 
         if not isinstance(id_or_xid, list):
             self._raise_on_wrong_ts_identifier_type(id_or_xid, arg_name, exp_type)
-        single_ts_queries = []
+
+        queries = []
+        parse_fn = partial(SingleTSQuery.parse_multiple_to_list, defaults=self.defaults)
         for ts in id_or_xid:
             if isinstance(ts, exp_type):
-                single_ts_queries.extend(
-                    SingleTSQuery.parse_multiple_to_list({arg_name: ts}, defaults=self.defaults)
-                )
+                queries.extend(parse_fn({arg_name: ts}))
+
             elif isinstance(ts, dict):
-                # Note: merge 'defaults' and given ts-dict; ts-dict takes precedence:
-                ts_dct = {**defaults, **ts}
-                self._validate_ts_query_dct(ts_dct, arg_name, exp_type)
-                single_ts_queries.append(SingleTSQuery(**ts_dct))
+                ts_validated = self._validate_ts_query_dct(ts, arg_name, exp_type)
+                queries.extend(parse_fn(ts_validated))
             else:
                 self._raise_on_wrong_ts_identifier_type(ts, arg_name, exp_type)
-        return single_ts_queries
+        return queries
 
     @staticmethod
     def _raise_on_wrong_ts_identifier_type(id_or_xid, arg_name, exp_type) -> NoReturn:
         raise TypeError(
-            f"Got unsupported type as, or part of argument `{arg_name}` ({type(id_or_xid)}). Expected one of "
-            f"{exp_type} or {dict}, or a (mixed) list of these, got `{id_or_xid!r}`."
+            f"Got unsupported type {type(id_or_xid)}, as, or part of argument `{arg_name}`. Expected one of "
+            f"{exp_type}, {dict} or a (mixed) list of these, but got `{id_or_xid}`."
         )
 
     @staticmethod
@@ -100,7 +90,7 @@ class NewDatapointsQuery(DatapointsQuery):
         if arg_name not in dct:
             if to_camel_case(arg_name) in dct:
                 # For backwards compatability we accept identifier in camel case:
-                dct = dct.copy()  # Avoid side effects
+                dct = dct.copy()  # Avoid side effects for user's input. Also means we need to return it.
                 dct[arg_name] = dct.pop(to_camel_case(arg_name))
             else:
                 raise KeyError(f"Missing key `{arg_name}` in dict passed as, or part of argument `{arg_name}`")
@@ -111,11 +101,12 @@ class NewDatapointsQuery(DatapointsQuery):
 
         opt_dct_keys = {"start", "end", "aggregates", "granularity", "include_outside_points", "limit"}
         bad_keys = set(dct) - opt_dct_keys - {arg_name}
-        if bad_keys:
-            raise KeyError(
-                f"Dict provided by argument `{arg_name}` included key(s) not understood: {sorted(bad_keys)}. "
-                f"Required key: `{arg_name}`. Optional: {list(opt_dct_keys)}."
-            )
+        if not bad_keys:
+            return dct
+        raise KeyError(
+            f"Dict provided by argument `{arg_name}` included key(s) not understood: {sorted(bad_keys)}. "
+            f"Required key: `{arg_name}`. Optional: {list(opt_dct_keys)}."
+        )
 
 
 @dataclass
@@ -128,7 +119,7 @@ class SingleTSQuery:
     include_outside_points: Optional[bool] = None
     limit: Optional[int] = None
     # Note `agg`: Only notable difference from regular query,
-    # enforcing exactly 0 or 1 aggregate.
+    # enforcing exactly 1 aggregate or None
     agg: Optional[str] = None
 
     @classmethod
@@ -145,7 +136,7 @@ class SingleTSQuery:
 
         elif aggregates is None:
             if granularity is None:
-                return cls(**dct, agg=aggregates)
+                return [cls(**dct, agg=aggregates)]
             raise KeyError(f"When passing `granularity`, argument `aggregates` is also required.")
 
         # Aggregates must be a list at this point:
@@ -154,17 +145,11 @@ class SingleTSQuery:
 
         elif granularity is None:
             raise KeyError(f"When passing `aggregates`, argument `granularity` is also required.")
-        return [cls(**dct, agg=agg) for agg in aggregates]
 
+        elif dct["include_outside_points"] is True:
+            raise ValueError("'Including outside points' is not supported for aggregates")
 
-    def validate(self):
-        if self.aggregates is None:
-            if self.granularity is not None:
-                # TODO(haakonvt): What if granularity comes from 'defaults'?
-                raise ValueError(
-                    "When supplying granularity, you must also specify aggregates. "
-                    f"Failed datapoints query: {dataclasses.asdict(self)}"
-                )
+        return [cls(**dct, agg=agg) for agg in aggregates]  # Finally
 
     def __repr__(self):
         # TODO(haakonvt): REMOVE
@@ -176,9 +161,9 @@ class SingleTSQuery:
         return f'{type(self).__name__}({s})'
 
 
-def parse_dps_queries(queries: Union[NewDatapointsQuery, List[NewDatapointsQuery]]):
-    if isinstance(query, NewDatapointsQuery):
-        queries = [queries]
+class QueryPlanner:
+    def __init__(self, queries: List[SingleTSQuery]):
+        self.queries = queries
 
 
 if __name__ == "__main__":
@@ -192,18 +177,18 @@ if __name__ == "__main__":
     INCLUDE_OUTSIDE_POINTS = None
     LIMIT = None
     IGNORE_UNKNOWN_IDS = False
-    # ID = None
-    ID = [
-        12345678,
-        {"id": 123, "aggregates": ["count", "average"]},
-    ]
+    ID = 12345678
+    # ID = [
+    #     12345678,
+    #     {"id": 123, "aggregates": ["count", "average"]},
+    # ]
     EXTERNAL_ID = [
         # "xiiiiiiid",
         # {"external_id": "asdf"},
         # {"externalId": "ASDF", "limit": -1, "granularity": "8h"},
         # None,
     ]
-    EXTERNAL_ID = None
+    EXTERNAL_ID = [{"limit": 4, "external_id": "FUCK"}]
 
     query = NewDatapointsQuery(
         start=START,
