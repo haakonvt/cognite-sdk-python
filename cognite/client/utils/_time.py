@@ -1,7 +1,8 @@
 import numbers
 import re
 import time
-from datetime import datetime
+import warnings
+from datetime import datetime, timezone
 from typing import Dict, List, Union
 
 _unit_in_ms_without_week = {"s": 1000, "m": 60000, "h": 3600000, "d": 86400000}
@@ -9,8 +10,15 @@ _unit_in_ms = {**_unit_in_ms_without_week, "w": 604800000}
 
 
 def datetime_to_ms(dt):
-    epoch = datetime.utcfromtimestamp(0)
-    return int((dt - epoch).total_seconds() * 1000.0)
+    if dt.tzinfo is None:
+        warnings.warn(
+            "Interpreting given naive datetime as UTC instead of local time (Python default behaviour). "
+            "This will change in the next major release. Please use (timezone) aware datetimes "
+            "or pass an integer with number of milliseconds since epoch (leap seconds excluded).",
+            PendingDeprecationWarning,
+        )
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(1000 * dt.timestamp())
 
 
 def ms_to_datetime(ms: Union[int, float]) -> datetime:
@@ -23,9 +31,7 @@ def ms_to_datetime(ms: Union[int, float]) -> datetime:
         datetime: Datetime object.
 
     """
-    if ms < 0:
-        raise ValueError("ms must be greater than or equal to zero.")
-    return datetime.utcfromtimestamp(ms / 1000)
+    return datetime.fromtimestamp(ms / 1000).astimezone(timezone.utc)
 
 
 def time_string_to_ms(pattern, string, unit_in_ms):

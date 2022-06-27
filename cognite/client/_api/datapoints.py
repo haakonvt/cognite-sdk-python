@@ -1000,13 +1000,8 @@ class DatapointsFetcher:
             count_task = _DPTask(
                 self.client, task.start, task.end, {"id": id}, ["count"], count_granularity, False, None, False
             )
-            # print("Getting COUNT...")
             self._get_all_datapoints(count_task, _DPWindow(task.start, task.end))
             res = count_task.result()
-            # import pandas as pd
-            # with pd.option_context("display.max_rows", None):
-            #     print(res.to_pandas())
-            # input("...")
         except CogniteAPIError:
             res = []
         if len(res) == 0:  # string based series or aggregates not yet calculated
@@ -1030,7 +1025,6 @@ class DatapointsFetcher:
             if i < len(counts) - 1:
                 next_timestamp = counts[i + 1][0]
                 next_raw_count = counts[i + 1][1]
-                # next_count = next_raw_count if task.granularity is None else agg_count(next_raw_count)
                 if task.granularity is None:
                     next_count = next_raw_count
                 else:
@@ -1038,7 +1032,7 @@ class DatapointsFetcher:
             else:
                 next_timestamp = task.end
                 next_count = 0
-            # current_count = count if task.granularity is None else agg_count(count)
+
             if task.granularity is None:
                 current_count = count
             else:
@@ -1087,6 +1081,7 @@ class DatapointsFetcher:
             "ignoreUnknownIds": task.ignore_unknown_ids,
             "limit": min(window.limit, task.request_limit),
         }
+        pprint(payload)
         res = self.client._post(self.client._RESOURCE_PATH + "/list", json=payload).json()["items"]
         if not res and task.ignore_unknown_ids:
             return task.mark_missing()
