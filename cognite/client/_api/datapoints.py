@@ -1007,7 +1007,6 @@ class DatapointsFetcher:
         if len(res) == 0:  # string based series or aggregates not yet calculated
             return [_DPWindow(task.start, task.end, remaining_user_limit)]
         counts = list(zip(res.timestamp, res.count))
-        # pprint(counts)
         windows = []
         total_count = 0
         current_window_count = 0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from abc import ABC
 from pprint import pprint
+import math
 import numbers
 from typing import List, Union, Optional, Dict, NoReturn
 from functools import partial, cached_property
@@ -124,8 +125,8 @@ class SingleTSQuery:
             # Millsecond resolution means at most 1k dps/sec
             count_gran = None
         else:
-            # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec)
-            count_gran = None
+            # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec):
+            count_gran = find_count_granularity_for_agg_query(self.start, self.end, self.granularity)
         return {
             **self._identifier_dct,
             "start": start,
@@ -210,6 +211,33 @@ class SingleTSQuery:
 # def sequence_split_gen(seq, n):
 #     yield from (seq[i:i + n] for i in range(0, len(seq), n))
 
+
+def find_count_granularity_for_agg_query(start, end, granularity):
+    # If every single period of aggregate dps exist we get a maximum retrieval of:
+    td = end - start
+    max_dps = td / pd.Timedelta(granularity_to_ms(granularity), unit="ms")
+    # We want to parallelize requests, each maxing out at 10k dps. When asking for all the `count`
+    # aggregates, we want to speed this up by grouping 10 time series, thus allowing 1k dps each:
+    n_timedeltas = min(1000, math.ceil(max_dps / 10_000))
+    gran = min(td, td / n_timedeltas)
+    if gran < pd.Timedelta(120, unit="s"):
+        n_gran = math.ceil(gran / pd.Timedelta(1, unit="s"))
+        return str(td), granularity, f"{n_gran}s"
+
+    elif gran < pd.Timedelta(120, unit="min"):
+        n_gran = math.ceil(gran / pd.Timedelta(1, unit="min"))
+        return str(td), granularity, f"{n_gran}m"
+
+    elif gran < pd.Timedelta(100000, unit="h"):
+        n_gran = math.ceil(gran / pd.Timedelta(1, unit="h"))
+        return str(td), granularity, f"{n_gran}h"
+
+    elif gran < pd.Timedelta(100000, unit="d"):
+        n_gran = math.ceil(gran / pd.Timedelta(1, unit="d"))
+        return str(td), granularity, f"{n_gran}d"
+    return ALSO NEED THE LIMIT!!!!!!!
+
+
 def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
     chunk, n_items, n_dps = [], 0, 0
     for item in payload.pop("items"):
@@ -254,6 +282,7 @@ def count_based_task_splitting(queries, client, max_workers=10):
             if not queries:
                 continue
             count_tasks = get_counts_and_create_tasks(queries, client)
+            for payload in chunk_queries_to_allowed_limits()
             # futures.append(
             #     pool.submit(get_counts_and_create_tasks, q_grp, client)
             # )
