@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms, granularity_unit_to_ms
 from cognite.client.data_classes import DatapointsQuery
-from cognite.client.exceptions import CogniteAPIError
+from cognite.client.exceptions import CogniteAPIError, CogniteNotFoundError
 from cognite.client.utils._auxiliary import to_camel_case
 
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
@@ -34,6 +34,7 @@ class NewDatapointsQuery(DatapointsQuery):
             aggregates=self.aggregates,
             granularity=self.granularity,
             include_outside_points=self.include_outside_points,
+            ignore_unknown_ids=self.ignore_unknown_ids,
         )
 
     @cached_property  # TODO: 3.8 feature
@@ -123,6 +124,7 @@ class SingleTSQuery:
     include_outside_points: Optional[bool] = None
     limit: Optional[int] = None
     aggregates: Optional[List[str]] = None
+    ignore_unknown_ids: Optional[bool] = None
 
     def get_count_agg_parameters(self):
         if self.is_raw_query:
@@ -132,7 +134,6 @@ class SingleTSQuery:
         else:
             # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec):
             limit, count_gran = find_count_granularity_for_agg_query(self.start, self.end, self.granularity)
-            print(f"\n\n{limit=}, {count_gran=}, {self.start=}, {self.end=}, {self.granularity=}")
         return {
             **self._identifier_dct,
             "start": self.start,
@@ -149,8 +150,10 @@ class SingleTSQuery:
 
     def _verify_identifier(self):
         if self.id is not None:
+            self._identifier_tpl = ("id", self.id)
             self._identifier_dct = {"id": self.id}
         elif self.external_id is not None:
+            self._identifier_tpl = ("externalId", self.external_id)
             self._identifier_dct = {"externalId": self.external_id}
         else:
             raise ValueError("Pass exactly one of `id` or `external_id`. Got neither.")
@@ -179,6 +182,8 @@ class SingleTSQuery:
 
     @property
     def is_missing(self):
+        if self._is_missing is None:
+            raise RuntimeError("Before making API-calls the `is_missing` status is unknown")
         return self._is_missing
 
     @is_missing.setter
@@ -215,7 +220,7 @@ class SingleTSQuery:
             raise ValueError(f"When passing `aggregates`, argument `granularity` is also required.")
 
         elif dct["include_outside_points"] is True:
-            raise ValueError("'Including outside points' is not supported for aggregates")
+            raise ValueError("'Include outside points' is not supported for aggregates.")
         return cls(**dct)  # Request for one or more aggregates
 
     def __repr__(self):
@@ -285,7 +290,9 @@ def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
         yield {**payload, "items": chunk}
 
 def single_datapoints_api_call(client, payload):
-    pprint(payload)
+    # print("payload:")
+    # pprint(payload)
+    # print()
     return client._post(client._RESOURCE_PATH + "/list", json=payload).json()["items"]
 
 
@@ -300,7 +307,12 @@ def build_count_query_payload(queries):
 def create_tasks_from_counts(client, queries, counts):
     try:
         res = single_datapoints_api_call(client, counts)
-        pprint(res)
+        not_missing = {("id", r["id"]) for r in res}
+        not_missing.update({("externalId", r["externalId"]) for r in res})
+        for q in queries:
+            q.is_missing = q._identifier_tpl in not_missing
+            if not q.ignore_unknown_ids and q.is_missing:
+                raise CogniteNotFoundError(not_found=[q._identifier_dct])
         return res
     except CogniteAPIError as e:
         print(f"{e!r}")
@@ -329,7 +341,10 @@ def count_based_task_splitting(queries, client, max_workers=10):
                 futures.append(pool.submit(create_tasks_from_counts, client, qs_chunk, count_chunk))
 
             for task in as_completed(futures):
-                print(task.result())
+                print("Calling .result() in 5")
+                import time
+                time.sleep(5)
+                print(f"{task.result() = }")
             # while futures:
             #     new_futures = []
             #     # Queue up new work as soon as possible by using `as_completed`:
@@ -340,40 +355,9 @@ def count_based_task_splitting(queries, client, max_workers=10):
 
 
 
-
-
 class DpsFetchOrchestrator:
     def __init__(self, queries: List[SingleTSQuery]):
         self.queries = queries
-
-    def plan_and_execute_queries(self, override_strategy=None):
-        if override_strategy is not None:
-            return _fetch_datapoints_until_completion(strategy)
-        info = self._inspect_queries()
-        strategy = self._select_fetch_strategy(info)
-        return _fetch_datapoints_until_completion(strategy)
-
-    def _inspect_queries(self):
-        for q in self.queries:
-            pass
-
-    def _select_fetch_strategy(self, info):
-        # Number of ts >>
-        return
-
-    def _fetch_datapoints_until_completion(self, strategy):
-        # Pseudo-code for illustration:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(do_stuff, x) for x in range(1, 6)]
-            new_futures = []
-            while True:
-                for task in as_completed(futures):
-                    res = task.result()
-                    if isinstance(res, NewDPSTask):
-                        new_futures.append(pool.submit(do_stuff, f"res-{res}"))
-                if not new_futures:
-                    return final_result
-                futures, new_futures = new_futures, []
 
 
 
@@ -387,13 +371,16 @@ if __name__ == "__main__":
     GRANULARITY = "12h"
     INCLUDE_OUTSIDE_POINTS = None
     LIMIT = None
-    IGNORE_UNKNOWN_IDS = False
+    IGNORE_UNKNOWN_IDS = True
     ID = None
     # ID = [
     #     {"id": 98768648669476, "aggregates": ["count", "average"], "granularity": "1d"},
     # ]
     EXTERNAL_ID = [
-        {"limit": None, "external_id": "ts-test-#01-daily-264/650"}
+        {"limit": None, "external_id": "ts-test-#01-daily-111/650"},
+        {"limit": None, "external_id": "ts-test-#01-daily-222/650"},
+        {"limit": None, "external_id": "ts-test-#01-daily-651/650"},
+        {"limit": None, "external_id": "ts-test-#01-daily-444/650"},
     ]
     query = NewDatapointsQuery(
         start=START,
