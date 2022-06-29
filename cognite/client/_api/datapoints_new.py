@@ -38,25 +38,25 @@ class NewDatapointsQuery(DatapointsQuery):
         )
 
     @cached_property  # TODO: 3.8 feature
-    def all_queries(self):
+    def all_validated_queries(self) -> TSQueryList:
         return self._validate_and_create_queries()
 
-    def _validate_and_create_queries(self):
-        all_queries = []
+    def _validate_and_create_queries(self) -> TSQueryList:
+        queries = []
         if self.id is not None:
-            all_queries.extend(
+            queries.extend(
                 self._validate_id_or_xid(
                     id_or_xid=self.id, is_external_id=False, defaults=self.defaults,
                 )
             )
         if self.external_id is not None:
-            all_queries.extend(
+            queries.extend(
                 self._validate_id_or_xid(
                     id_or_xid=self.external_id, is_external_id=True, defaults=self.defaults,
                 )
             )
-        if all_queries:
-            return all_queries
+        if queries:
+            return TSQueryList(queries)
         raise ValueError("Pass at least one time series `id` or `external_id`!")
 
     def _validate_id_or_xid(self, id_or_xid, is_external_id: bool, defaults: Dict):
@@ -74,11 +74,11 @@ class NewDatapointsQuery(DatapointsQuery):
         queries = []
         for ts in id_or_xid:
             if isinstance(ts, exp_type):
-                queries.append(SingleTSQuery.from_dict_with_validation({arg_name: ts}, defaults=self.defaults))
+                queries.append(TSQuery.from_dict_with_validation({arg_name: ts}, defaults=self.defaults))
 
             elif isinstance(ts, dict):
                 ts_validated = self._validate_ts_query_dct(ts, arg_name, exp_type)
-                queries.append(SingleTSQuery.from_dict_with_validation(ts_validated, defaults=self.defaults))
+                queries.append(TSQuery.from_dict_with_validation(ts_validated, defaults=self.defaults))
             else:
                 self._raise_on_wrong_ts_identifier_type(ts, arg_name, exp_type)
         return queries
@@ -115,7 +115,28 @@ class NewDatapointsQuery(DatapointsQuery):
 
 
 @dataclass
-class SingleTSQuery:
+class TSQueryList:
+    queries: List[TSQuery]
+
+    def __post_init__(self):
+        # We split because it is likely that a user asking for aggregates knows not to ask for
+        # string time series, making the need for additional API calls less likely:
+        split_qs = [], []
+        for q in self.queries:
+            split_qs[q.is_raw_query].append(q)
+        self._aggregate_queries, self._raw_queries = split_qs
+
+    @property
+    def raw_queries(self):
+        return self._raw_queries
+
+    @property
+    def aggregate_queries(self):
+        return self._aggregate_queries
+
+
+@dataclass
+class TSQuery:
     id: Optional[int] = None
     external_id: Optional[str] = None
     start: Union[int, str, datetime, None] = None
@@ -129,13 +150,13 @@ class SingleTSQuery:
     def get_count_agg_parameters(self):
         if self.is_raw_query:
             # Millsecond resolution means at most 1k dps/sec
-            count_gran = None
+            limit, count_gran = None, None
             raise NotImplementedError("Raw queries not yet supported")
         else:
             # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec):
-            limit, count_gran = find_count_granularity_for_agg_query(self.start, self.end, self.granularity)
+            limit, count_gran = find_count_granularity_for_agg_query(self.start, self.end, self.granularity, self.limit)
         return {
-            **self._identifier_dct,
+            **self.identifier_dct,
             "start": self.start,
             "end": self.end,
             "granularity": count_gran,
@@ -143,18 +164,19 @@ class SingleTSQuery:
         }
 
     def __post_init__(self):
-        self._is_missing = None  # I.e. not set.
+        self._is_missing = None  # I.e. not set...
+        self._is_string = None  # ...or unknown
         self._verify_time_range()
         self._verify_limit()
         self._verify_identifier()
 
     def _verify_identifier(self):
         if self.id is not None:
-            self._identifier_tpl = ("id", self.id)
-            self._identifier_dct = {"id": self.id}
+            self.identifier_tpl = ("id", self.id)
+            self.identifier_dct = {"id": self.id}
         elif self.external_id is not None:
-            self._identifier_tpl = ("externalId", self.external_id)
-            self._identifier_dct = {"externalId": self.external_id}
+            self.identifier_tpl = ("externalId", self.external_id)
+            self.identifier_dct = {"externalId": self.external_id}
         else:
             raise ValueError("Pass exactly one of `id` or `external_id`. Got neither.")
 
@@ -192,11 +214,20 @@ class SingleTSQuery:
         self._is_missing = value
 
     @property
+    def is_string(self):
+        return self._is_string
+
+    @is_string.setter
+    def is_string(self, value):
+        assert isinstance(value, bool)
+        self._is_string = value
+
+    @property
     def is_raw_query(self):
         return self.aggregates is None
 
     @classmethod
-    def from_dict_with_validation(cls, ts_dct, defaults) -> List[SingleTSQuery]:
+    def from_dict_with_validation(cls, ts_dct, defaults) -> TSQuery:
         # We merge 'defaults' and given ts-dict, ts-dict takes precedence:
         dct = {**defaults, **ts_dct}
         granularity, aggregates = dct["granularity"], dct["aggregates"]
@@ -246,7 +277,8 @@ def align_with_granularity_unit(ts: int, granularity: str, is_end: bool):
     return ts - ts % gms + is_end*gms
 
 
-def find_count_granularity_for_agg_query(start: int, end: int, granularity: str):
+def find_count_granularity_for_agg_query(start: int, end: int, granularity: str, limit: Optional[int]):
+    print(f"Ignoring {limit=}")
     # If every single period of aggregate dps exist we get a maximum number of dps:
     td = end - start
     max_dps = max(1, td / granularity_to_ms(granularity))
@@ -289,11 +321,9 @@ def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
     if chunk:
         yield {**payload, "items": chunk}
 
+
 def single_datapoints_api_call(client, payload):
-    # print("payload:")
-    # pprint(payload)
-    # print()
-    return client._post(client._RESOURCE_PATH + "/list", json=payload).json()["items"]
+    return client.datapoints._post(client.datapoints._RESOURCE_PATH + "/list", json=payload).json()["items"]
 
 
 def build_count_query_payload(queries):
@@ -304,33 +334,74 @@ def build_count_query_payload(queries):
     }
 
 
+def handle_missing_ts(res, queries):
+    missing = []
+    not_missing = {("id", r["id"]) for r in res}.union(("externalId", r["externalId"]) for r in res)
+    for q in queries:
+        q.is_missing = q.identifier_tpl not in not_missing
+        # We might be handling multiple simultaneous top-level queries, each with
+        # different settings for "ignore unknown":
+        if q.is_missing and not q.ignore_unknown_ids:
+            missing.append(q.identifier_dct)
+    if missing:
+        raise CogniteNotFoundError(not_found=missing)
+
+
+def handle_string_ts(string_ts, queries):
+    not_supported_qs = []
+    for q in queries:
+        id_type, identifier = q.identifier_tpl
+        if identifier in string_ts[id_type]:
+            q.is_string = True
+            if not q.is_raw_query:
+                not_supported_qs.append(q.identifier_dct)
+    if not_supported_qs:
+        raise ValueError(
+            f"Aggregates are not supported for string time series: {not_supported_qs}"
+        ) from None
+
+
+def get_is_string_property(client, queries):
+    # We do not know if duplicates exist between those given by `id` and `external_id`.
+    # Quick fix is to send two separate queries ಠಿ_ಠ
+    # TODO(haakonvt): Not finished. Want to parallelize these calls for sure
+    ids = list(set(q.identifier_tpl[1] for q in queries if q.identifier_tpl[0] == "id"))
+    xids = list(set(q.identifier_tpl[1] for q in queries if q.identifier_tpl[0] == "externalId"))
+    ids_ts = client.time_series.retrieve_multiple(
+        ids=ids,
+        ignore_unknown_ids=True,
+    )
+    xids_ts = client.time_series.retrieve_multiple(
+        external_ids=xids,
+        ignore_unknown_ids=True,
+    )
+    return {
+        "id": {ts.id for ts in ids_ts if ts.is_string},
+        "externalId": {ts.external_id for ts in xids_ts if ts.is_string},
+    }
+
+
 def create_tasks_from_counts(client, queries, counts):
     try:
         res = single_datapoints_api_call(client, counts)
-        not_missing = {("id", r["id"]) for r in res}
-        not_missing.update({("externalId", r["externalId"]) for r in res})
-        for q in queries:
-            q.is_missing = q._identifier_tpl in not_missing
-            if not q.ignore_unknown_ids and q.is_missing:
-                raise CogniteNotFoundError(not_found=[q._identifier_dct])
+        handle_missing_ts(res, queries)
         return res
     except CogniteAPIError as e:
-        print(f"{e!r}")
-        print(vars(e))
-        raise NotImplementedError("Unable to fetch count, not yet implemented backup-logic") from None
+        if e.code == 400:
+            # Likely: "Aggregates are not supported for string time series"
+            string_ts = get_is_string_property(client, queries)
+            handle_string_ts(string_ts, queries)
+        else:
+            print(f"{e!r}")
+            print(vars(e))
+            raise NotImplementedError("Unable to fetch count, not yet implemented backup-logic") from None
 
 
-def count_based_task_splitting(queries, client, max_workers=10):
-    agg_queries, raw_queries = [], []
-    for q in queries:
-        # We split because it is likely that a user asking for aggregates knows not to ask for
-        # string time series, making the need for additional API calls less likely:
-        (agg_queries, raw_queries)[q.is_raw_query].append(q)
-
+def count_based_task_splitting(query_lst, client, max_workers=10):
     # Set up pool using `max_workers` using at least 1 thread:
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
         futures = []
-        for queries in (raw_queries, agg_queries):
+        for queries in (query_lst.raw_queries, query_lst.aggregate_queries):
             if not queries:
                 continue
             qs_it = iter(queries)
@@ -341,9 +412,9 @@ def count_based_task_splitting(queries, client, max_workers=10):
                 futures.append(pool.submit(create_tasks_from_counts, client, qs_chunk, count_chunk))
 
             for task in as_completed(futures):
-                print("Calling .result() in 5")
+                print("Calling .result() in 1")
                 import time
-                time.sleep(5)
+                time.sleep(1)
                 print(f"{task.result() = }")
             # while futures:
             #     new_futures = []
@@ -352,13 +423,6 @@ def count_based_task_splitting(queries, client, max_workers=10):
             #         new_futures.append(all_new_tasks)
             #
             #     futures = new_futures
-
-
-
-class DpsFetchOrchestrator:
-    def __init__(self, queries: List[SingleTSQuery]):
-        self.queries = queries
-
 
 
 if __name__ == "__main__":
@@ -372,15 +436,19 @@ if __name__ == "__main__":
     INCLUDE_OUTSIDE_POINTS = None
     LIMIT = None
     IGNORE_UNKNOWN_IDS = True
+    IGNORE_UNKNOWN_IDS = False
     ID = None
-    # ID = [
-    #     {"id": 98768648669476, "aggregates": ["count", "average"], "granularity": "1d"},
-    # ]
+    ID = [
+        {"id": 2546012653669, "aggregates": ["count", "average"], "granularity": "1d"},  # string
+    ]
     EXTERNAL_ID = [
-        {"limit": None, "external_id": "ts-test-#01-daily-111/650"},
-        {"limit": None, "external_id": "ts-test-#01-daily-222/650"},
-        {"limit": None, "external_id": "ts-test-#01-daily-651/650"},
-        {"limit": None, "external_id": "ts-test-#01-daily-444/650"},
+        # {"limit": None, "external_id": "ts-test-#01-daily-111/650"},
+        # {"limit": None, "external_id": "ts-test-#01-daily-222/650"},
+        # {"limit": None, "external_id": "ts-test-#01-daily-651/650"},
+        {"limit": None, "external_id": "8400074_destination"},  # string
+        {"limit": None, "external_id": "9624122_cargo_type"},  # string
+        # {"limit": None, "external_id": "ts-test-#01-daily-64/650"},
+        # {"limit": None, "external_id": "ts-test-#01-daily-444/650"},
     ]
     query = NewDatapointsQuery(
         start=START,
@@ -393,8 +461,8 @@ if __name__ == "__main__":
         limit=LIMIT,
         ignore_unknown_ids=IGNORE_UNKNOWN_IDS,
     )
-    q = query.all_queries
+    q = query.all_validated_queries
     pprint(q)
     from local_cog_client import setup_local_cog_client
     client = setup_local_cog_client()
-    count_based_task_splitting(q, client.datapoints, max_workers=1)
+    count_based_task_splitting(q, client, max_workers=1)
