@@ -7,16 +7,20 @@ from typing import List, Union, Optional, Dict, NoReturn
 from functools import partial, cached_property
 from datetime import datetime
 import dataclasses
+import itertools
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 # from timeit import default_timer as timer
 
 from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms, granularity_unit_to_ms
 from cognite.client.data_classes import DatapointsQuery
+from cognite.client.exceptions import CogniteAPIError
 from cognite.client.utils._auxiliary import to_camel_case
 
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
+
+TIME_UNIT_IN_MS = {"s": 1000, "m": 60000, "h": 3600000, "d": 86400000}
 
 
 class NewDatapointsQuery(DatapointsQuery):
@@ -118,44 +122,60 @@ class SingleTSQuery:
     granularity: Optional[str] = None
     include_outside_points: Optional[bool] = None
     limit: Optional[int] = None
-    aggregation: Optional[List[str]] = None
+    aggregates: Optional[List[str]] = None
 
     def get_count_agg_parameters(self):
         if self.is_raw_query:
             # Millsecond resolution means at most 1k dps/sec
             count_gran = None
+            raise NotImplementedError("Raw queries not yet supported")
         else:
             # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec):
-            count_gran = find_count_granularity_for_agg_query(self.start, self.end, self.granularity)
+            limit, count_gran = find_count_granularity_for_agg_query(self.start, self.end, self.granularity)
+            print(f"\n\n{limit=}, {count_gran=}, {self.start=}, {self.end=}, {self.granularity=}")
         return {
             **self._identifier_dct,
-            "start": start,
-            "end": end,
+            "start": self.start,
+            "end": self.end,
             "granularity": count_gran,
+            "limit": limit,
         }
 
     def __post_init__(self):
-        self._is_missing = None  # I.e. not set
-        self.start, self.end = self.verify_time_range(self.start, self.end)
+        self._is_missing = None  # I.e. not set.
+        self._verify_time_range()
+        self._verify_limit()
+        self._verify_identifier()
+
+    def _verify_identifier(self):
         if self.id is not None:
             self._identifier_dct = {"id": self.id}
         elif self.external_id is not None:
-            self._identifier_dct = {"external_id": self.external_id}
-        raise ValueError("Pass exactly one of `id` or `external_id`. Got neither.")
-
-    @staticmethod
-    def verify_time_range(start, end):
-        if start is None:
-            start = 0
+            self._identifier_dct = {"externalId": self.external_id}
         else:
-            start = timestamp_to_ms(start)
-        if end is None:
-            end = "now"
-        end = timestamp_to_ms(end)
+            raise ValueError("Pass exactly one of `id` or `external_id`. Got neither.")
 
-        if end <= start:
+    def _verify_limit(self):
+        if self.limit in {None, -1, math.inf}:
+            self.limit = None
+        elif not isinstance(self.limit, numbers.Number):
+            raise TypeError(f"Limit must be an integer or one of [None, -1, inf], got {type(self.limit)}")
+
+    def _verify_time_range(self):
+        if self.start is None:
+            self.start = 0
+        else:
+            self.start = timestamp_to_ms(self.start)
+        if self.end is None:
+            self.end = "now"
+        self.end = timestamp_to_ms(self.end)
+
+        if self.end <= self.start:
             raise ValueError("Invalid time range, `end` must be later than `start`")
-        return start, end
+
+        if not self.is_raw_query:  # API rounds aggregate queries
+            self.start = align_with_granularity_unit(self.start, self.granularity, is_end=False)
+            self.end = align_with_granularity_unit(self.end, self.granularity, is_end=True)
 
     @property
     def is_missing(self):
@@ -168,7 +188,7 @@ class SingleTSQuery:
 
     @property
     def is_raw_query(self):
-        return self.aggregation is None
+        return self.aggregates is None
 
     @classmethod
     def from_dict_with_validation(cls, ts_dct, defaults) -> List[SingleTSQuery]:
@@ -185,14 +205,14 @@ class SingleTSQuery:
         elif aggregates is None:
             if granularity is None:
                 return cls(**dct)  # Request for raw datapoints
-            raise KeyError(f"When passing `granularity`, argument `aggregates` is also required.")
+            raise ValueError(f"When passing `granularity`, argument `aggregates` is also required.")
 
         # Aggregates must be a list at this point:
         elif len(aggregates) == 0:
             raise ValueError("Empty list of `aggregates` passed, expected at least one!")
 
         elif granularity is None:
-            raise KeyError(f"When passing `aggregates`, argument `granularity` is also required.")
+            raise ValueError(f"When passing `aggregates`, argument `granularity` is also required.")
 
         elif dct["include_outside_points"] is True:
             raise ValueError("'Including outside points' is not supported for aggregates")
@@ -212,30 +232,42 @@ class SingleTSQuery:
 #     yield from (seq[i:i + n] for i in range(0, len(seq), n))
 
 
-def find_count_granularity_for_agg_query(start, end, granularity):
-    # If every single period of aggregate dps exist we get a maximum retrieval of:
+def align_with_granularity_unit(ts: int, granularity: str, is_end: bool):
+    # Note the API always aligns with 1s, 1m, 1h or 1d (even when given e.g. 73h)
+    gms = granularity_unit_to_ms(granularity)
+    if ts % gms == 0:
+        return ts
+    # `start` is floored and `end` is ceiled when ts is not exactly at boundary
+    return ts - ts % gms + is_end*gms
+
+
+def find_count_granularity_for_agg_query(start: int, end: int, granularity: str):
+    # If every single period of aggregate dps exist we get a maximum number of dps:
     td = end - start
-    max_dps = td / pd.Timedelta(granularity_to_ms(granularity), unit="ms")
-    # We want to parallelize requests, each maxing out at 10k dps. When asking for all the `count`
-    # aggregates, we want to speed this up by grouping 10 time series, thus allowing 1k dps each:
-    n_timedeltas = min(1000, math.ceil(max_dps / 10_000))
+    max_dps = max(1, td / granularity_to_ms(granularity))
+    # We want to parallelize requests, each maxing out at 10k dps. When asking for all the
+    # `count` aggregates, we want to speed this up by grouping 10 time series, thus allowing >1k each:
+    n_timedeltas = min(1000, math.ceil(max_dps / 10_000))  # This is the `limit`
     gran = min(td, td / n_timedeltas)
-    if gran < pd.Timedelta(120, unit="s"):
-        n_gran = math.ceil(gran / pd.Timedelta(1, unit="s"))
-        return str(td), granularity, f"{n_gran}s"
+    if gran < 120*TIME_UNIT_IN_MS["s"]:
+        n = math.ceil(gran / TIME_UNIT_IN_MS["s"])
+        return n_timedeltas, f"{n}s",
 
-    elif gran < pd.Timedelta(120, unit="min"):
-        n_gran = math.ceil(gran / pd.Timedelta(1, unit="min"))
-        return str(td), granularity, f"{n_gran}m"
+    elif gran < 120*TIME_UNIT_IN_MS["m"]:
+        n = math.ceil(gran / TIME_UNIT_IN_MS["m"])
+        return n_timedeltas, f"{n}m",
 
-    elif gran < pd.Timedelta(100000, unit="h"):
-        n_gran = math.ceil(gran / pd.Timedelta(1, unit="h"))
-        return str(td), granularity, f"{n_gran}h"
+    elif gran < 100_000*TIME_UNIT_IN_MS["h"]:
+        n = math.ceil(gran / TIME_UNIT_IN_MS["h"])
+        return n_timedeltas, f"{n}h",
 
-    elif gran < pd.Timedelta(100000, unit="d"):
-        n_gran = math.ceil(gran / pd.Timedelta(1, unit="d"))
-        return str(td), granularity, f"{n_gran}d"
-    return ALSO NEED THE LIMIT!!!!!!!
+    elif gran < 100_000*TIME_UNIT_IN_MS["d"]:
+        n = math.ceil(gran / TIME_UNIT_IN_MS["d"])
+        return n_timedeltas, f"{n}d",
+    else:
+        # Not possible with current TimeSeriesAPI in v1. To futureproof for potential increase
+        # of time range, we return max granularity and an a wild overestimate of required time windows:
+        return 1000, "100000d"  # 274k years. Current API limit is 80 years...
 
 
 def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
@@ -252,27 +284,35 @@ def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
     if chunk:
         yield {**payload, "items": chunk}
 
-
 def single_datapoints_api_call(client, payload):
-    res = client._post(client._RESOURCE_PATH + "/list", json=payload).json()["items"]
+    pprint(payload)
+    return client._post(client._RESOURCE_PATH + "/list", json=payload).json()["items"]
 
 
 def build_count_query_payload(queries):
     return {
         "aggregates": ["count"],
         "ignoreUnknownIds": True,  # Avoids a potential extra query
-        "items": [q.get_count_agg_parameters() for q in queries]
+        "items": [q.get_count_agg_parameters() for q in queries],
     }
 
 
-def get_counts_and_create_tasks(queries, client):
-    payload = build_count_query_payload(queries)
-    res = single_datapoints_api_call(client, payload)
+def create_tasks_from_counts(client, queries, counts):
+    try:
+        res = single_datapoints_api_call(client, counts)
+        pprint(res)
+        return res
+    except CogniteAPIError as e:
+        print(f"{e!r}")
+        print(vars(e))
+        raise NotImplementedError("Unable to fetch count, not yet implemented backup-logic") from None
 
 
 def count_based_task_splitting(queries, client, max_workers=10):
     agg_queries, raw_queries = [], []
     for q in queries:
+        # We split because it is likely that a user asking for aggregates knows not to ask for
+        # string time series, making the need for additional API calls less likely:
         (agg_queries, raw_queries)[q.is_raw_query].append(q)
 
     # Set up pool using `max_workers` using at least 1 thread:
@@ -281,18 +321,22 @@ def count_based_task_splitting(queries, client, max_workers=10):
         for queries in (raw_queries, agg_queries):
             if not queries:
                 continue
-            count_tasks = get_counts_and_create_tasks(queries, client)
-            for payload in chunk_queries_to_allowed_limits()
-            # futures.append(
-            #     pool.submit(get_counts_and_create_tasks, q_grp, client)
-            # )
+            qs_it = iter(queries)
+            count_tasks = build_count_query_payload(queries)
+            # Smash together as many of the count-aggregate requets as possible:
+            for count_chunk in chunk_queries_to_allowed_limits(count_tasks):
+                qs_chunk = list(itertools.islice(qs_it, len(count_chunk["items"])))
+                futures.append(pool.submit(create_tasks_from_counts, client, qs_chunk, count_chunk))
 
-
-        futures = [pool.submit(do_stuff, x) for x in range(1, 6)]
-        new_futures = []
-        while True:
             for task in as_completed(futures):
-
+                print(task.result())
+            # while futures:
+            #     new_futures = []
+            #     # Queue up new work as soon as possible by using `as_completed`:
+            #     for task in as_completed(futures):
+            #         new_futures.append(all_new_tasks)
+            #
+            #     futures = new_futures
 
 
 
@@ -339,24 +383,18 @@ if __name__ == "__main__":
     # specify an empty string to get raw data.
     START = None
     END = None
-    AGGREGATES = ["count"]
-    GRANULARITY = "4d"
+    AGGREGATES = ["average"]
+    GRANULARITY = "12h"
     INCLUDE_OUTSIDE_POINTS = None
     LIMIT = None
     IGNORE_UNKNOWN_IDS = False
-    ID = 12345678
+    ID = None
     # ID = [
-    #     12345678,
-    #     {"id": 123, "aggregates": ["count", "average"]},
+    #     {"id": 98768648669476, "aggregates": ["count", "average"], "granularity": "1d"},
     # ]
     EXTERNAL_ID = [
-        # "xiiiiiiid",
-        # {"external_id": "asdf"},
-        # {"externalId": "ASDF", "limit": -1, "granularity": "8h"},
-        # None,
+        {"limit": None, "external_id": "ts-test-#01-daily-264/650"}
     ]
-    EXTERNAL_ID = [{"limit": 4, "external_id": "FUCK"}]
-
     query = NewDatapointsQuery(
         start=START,
         end=END,
@@ -370,3 +408,6 @@ if __name__ == "__main__":
     )
     q = query.all_queries
     pprint(q)
+    from local_cog_client import setup_local_cog_client
+    client = setup_local_cog_client()
+    count_based_task_splitting(q, client.datapoints, max_workers=1)
