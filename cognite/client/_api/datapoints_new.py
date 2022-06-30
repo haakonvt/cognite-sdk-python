@@ -150,7 +150,7 @@ class TSQuery:
     def get_count_agg_parameters(self):
         if self.is_raw_query:
             # Millsecond resolution means at most 1k dps/sec
-            limit, count_gran = None, None
+            # limit, count_gran = 1000, "1000d"
             raise NotImplementedError("Raw queries not yet supported")
         else:
             # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec):
@@ -278,28 +278,35 @@ def align_with_granularity_unit(ts: int, granularity: str, is_end: bool):
 
 
 def find_count_granularity_for_agg_query(start: int, end: int, granularity: str, limit: Optional[int]):
-    print(f"Ignoring {limit=}")
-    # If every single period of aggregate dps exist we get a maximum number of dps:
+    print(f"TODO: Ignoring {limit=}. If low, like 50, we know a single request will do.")
     td = end - start
-    max_dps = max(1, td / granularity_to_ms(granularity))
+    if limit is None:
+        # If every single period of aggregate dps exist, we get a maximum number of dps:
+        max_dps = max(1, td / granularity_to_ms(granularity))
+    elif limit <= 10_000:
+        # We can fetch everything in one request, so count agg request is pointless.
+        max_dps = 1
+    else:  # 10k < limit < inf
+        max_dps = limit
+
     # We want to parallelize requests, each maxing out at 10k dps. When asking for all the
     # `count` aggregates, we want to speed this up by grouping 10 time series, thus allowing >1k each:
     n_timedeltas = min(1000, math.ceil(max_dps / 10_000))  # This is the `limit`
-    gran = min(td, td / n_timedeltas)
-    if gran < 120*TIME_UNIT_IN_MS["s"]:
-        n = math.ceil(gran / TIME_UNIT_IN_MS["s"])
+    gran_ms = min(td, td / n_timedeltas)
+    if gran_ms < 120 * TIME_UNIT_IN_MS["s"]:
+        n = math.ceil(gran_ms / TIME_UNIT_IN_MS["s"])
         return n_timedeltas, f"{n}s",
 
-    elif gran < 120*TIME_UNIT_IN_MS["m"]:
-        n = math.ceil(gran / TIME_UNIT_IN_MS["m"])
+    elif gran_ms < 120 * TIME_UNIT_IN_MS["m"]:
+        n = math.ceil(gran_ms / TIME_UNIT_IN_MS["m"])
         return n_timedeltas, f"{n}m",
 
-    elif gran < 100_000*TIME_UNIT_IN_MS["h"]:
-        n = math.ceil(gran / TIME_UNIT_IN_MS["h"])
+    elif gran_ms < 100_000 * TIME_UNIT_IN_MS["h"]:
+        n = math.ceil(gran_ms / TIME_UNIT_IN_MS["h"])
         return n_timedeltas, f"{n}h",
 
-    elif gran < 100_000*TIME_UNIT_IN_MS["d"]:
-        n = math.ceil(gran / TIME_UNIT_IN_MS["d"])
+    elif gran_ms < 100_000 * TIME_UNIT_IN_MS["d"]:
+        n = math.ceil(gran_ms / TIME_UNIT_IN_MS["d"])
         return n_timedeltas, f"{n}d",
     else:
         # Not possible with current TimeSeriesAPI in v1. To futureproof for potential increase
@@ -351,14 +358,23 @@ def handle_string_ts(string_ts, queries):
     not_supported_qs = []
     for q in queries:
         id_type, identifier = q.identifier_tpl
-        if identifier in string_ts[id_type]:
-            q.is_string = True
-            if not q.is_raw_query:
-                not_supported_qs.append(q.identifier_dct)
+        q.is_string = identifier in string_ts[id_type]
+        if q.is_string and not q.is_raw_query:
+            not_supported_qs.append(q.identifier_dct)
     if not_supported_qs:
         raise ValueError(
             f"Aggregates are not supported for string time series: {not_supported_qs}"
         ) from None
+
+
+# @dataclass
+# class Task:
+#     function: Callable
+#     args: Tuple[object, ...]
+#     kwargs: Mapping[str, object]
+#
+#     def execute(self):
+#         return self.function(*args, **kwargs)
 
 
 def get_is_string_property(client, queries):
@@ -367,14 +383,8 @@ def get_is_string_property(client, queries):
     # TODO(haakonvt): Not finished. Want to parallelize these calls for sure
     ids = list(set(q.identifier_tpl[1] for q in queries if q.identifier_tpl[0] == "id"))
     xids = list(set(q.identifier_tpl[1] for q in queries if q.identifier_tpl[0] == "externalId"))
-    ids_ts = client.time_series.retrieve_multiple(
-        ids=ids,
-        ignore_unknown_ids=True,
-    )
-    xids_ts = client.time_series.retrieve_multiple(
-        external_ids=xids,
-        ignore_unknown_ids=True,
-    )
+    ids_ts = client.time_series.retrieve_multiple(ids=ids, ignore_unknown_ids=True)
+    xids_ts = client.time_series.retrieve_multiple(external_ids=xids, ignore_unknown_ids=True)
     return {
         "id": {ts.id for ts in ids_ts if ts.is_string},
         "externalId": {ts.external_id for ts in xids_ts if ts.is_string},
@@ -387,14 +397,29 @@ def create_tasks_from_counts(client, queries, counts):
         handle_missing_ts(res, queries)
         return res
     except CogniteAPIError as e:
+        print(f"{e!r}")
         if e.code == 400:
             # Likely: "Aggregates are not supported for string time series"
             string_ts = get_is_string_property(client, queries)
             handle_string_ts(string_ts, queries)
-        else:
-            print(f"{e!r}")
-            print(vars(e))
-            raise NotImplementedError("Unable to fetch count, not yet implemented backup-logic") from None
+            query_subset = [q for q in queries if not q.is_string]
+            if not query_subset:
+                return []  # All ts are string
+            keep_identifiers = {q.identifier_tpl for q in query_subset}
+            keep_items = [
+                ic for ic in counts["items"]
+                if ("id", ic.get("id")) in keep_identifiers
+                or ("externalId", ic.get("externalId")) in keep_identifiers
+            ]
+            print(f"{query_subset = }")
+            print(f"{keep_identifiers = }")
+            print(f"{keep_items = }")
+            print('{**counts, "items": keep_items} = ', {**counts, "items": keep_items})
+            input("here again??\n\n")
+            return create_tasks_from_counts(client, query_subset, {**counts, "items": keep_items})
+        print(f"{e!r}")
+        pprint(vars(e))
+        raise
 
 
 def count_based_task_splitting(query_lst, client, max_workers=10):
@@ -431,19 +456,20 @@ if __name__ == "__main__":
     # specify an empty string to get raw data.
     START = None
     END = None
-    AGGREGATES = ["average"]
-    GRANULARITY = "12h"
+    AGGREGATES = None  # ["average"]
+    GRANULARITY = None  # "12h"
     INCLUDE_OUTSIDE_POINTS = None
     LIMIT = None
     IGNORE_UNKNOWN_IDS = True
     IGNORE_UNKNOWN_IDS = False
     ID = None
     ID = [
-        {"id": 2546012653669, "aggregates": ["count", "average"], "granularity": "1d"},  # string
+        {"id": 2546012653669},  # string
+        # {"id": 2546012653669, "aggregates": ["max", "average"], "granularity": "1d"},  # string
     ]
     EXTERNAL_ID = [
         # {"limit": None, "external_id": "ts-test-#01-daily-111/650"},
-        # {"limit": None, "external_id": "ts-test-#01-daily-222/650"},
+        {"limit": None, "external_id": "ts-test-#01-daily-222/650"},
         # {"limit": None, "external_id": "ts-test-#01-daily-651/650"},
         {"limit": None, "external_id": "8400074_destination"},  # string
         {"limit": None, "external_id": "9624122_cargo_type"},  # string
