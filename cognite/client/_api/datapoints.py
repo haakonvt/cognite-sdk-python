@@ -730,7 +730,7 @@ class DatapointsPoster:
         valid_dps_objects = []
         for dps_object in dps_object_list:
             for key in dps_object:
-                if key not in ("id", "externalId", "datapoints"):
+                if key not in {"id", "externalId", "datapoints"}:
                     raise ValueError(
                         "Invalid key '{}' in datapoints. Must contain 'datapoints', and 'id' or 'externalId".format(key)
                     )

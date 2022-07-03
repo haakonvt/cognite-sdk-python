@@ -1,11 +1,12 @@
 from __future__ import annotations
 from abc import ABC
-from pprint import pprint
+from pprint import pprint, pformat
 import math
 import numbers
 from typing import List, Union, Optional, Dict, NoReturn
 from functools import partial, cached_property
 from datetime import datetime
+import enum
 import dataclasses
 import itertools
 from dataclasses import dataclass
@@ -21,6 +22,11 @@ print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
 
 TIME_UNIT_IN_MS = {"s": 1000, "m": 60000, "h": 3600000, "d": 86400000}
+
+# TODO list
+# - Should be a special method named "retrieve_string_datapoints"
+# - Should be possible to specify `is_string` both as default and per-ts kwarg
+# -
 
 
 class NewDatapointsQuery(DatapointsQuery):
@@ -147,14 +153,25 @@ class TSQuery:
     aggregates: Optional[List[str]] = None
     ignore_unknown_ids: Optional[bool] = None
 
-    def get_count_agg_parameters(self):
+    def __post_init__(self):
+        self._is_missing = None  # I.e. not set...
+        self._is_string = None  # ...or unknown
+        self._verify_time_range()
+        self._verify_limit()
+        self._verify_identifier()
+
+    def get_count_query_params(self):
         if self.is_raw_query:
-            # Millsecond resolution means at most 1k dps/sec
-            # limit, count_gran = 1000, "1000d"
-            raise NotImplementedError("Raw queries not yet supported")
-        else:
-            # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec):
-            limit, count_gran = find_count_granularity_for_agg_query(self.start, self.end, self.granularity, self.limit)
+            # With a maximum of millisecond resolution, we peak at 1k dps/sec. Realistically
+            # though, most time series are far less dense. We make a guess of '1s' (prob too high even):
+            granularity = "1s"  # TODO: Can be tweaked with real-world data?
+            dps_api_limit = 100_000
+        else:  # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec):
+            granularity = self.granularity
+            dps_api_limit = 10_000
+        limit, count_gran = find_count_granularity_for_query(
+            self.start, self.end, granularity, self.limit, dps_api_limit,
+        )
         return {
             **self.identifier_dct,
             "start": self.start,
@@ -163,22 +180,18 @@ class TSQuery:
             "limit": limit,
         }
 
-    def __post_init__(self):
-        self._is_missing = None  # I.e. not set...
-        self._is_string = None  # ...or unknown
-        self._verify_time_range()
-        self._verify_limit()
-        self._verify_identifier()
-
     def _verify_identifier(self):
         if self.id is not None:
-            self.identifier_tpl = ("id", self.id)
-            self.identifier_dct = {"id": self.id}
+            self.identifier_type = "id"
+            self.identifier = self.id
         elif self.external_id is not None:
-            self.identifier_tpl = ("externalId", self.external_id)
-            self.identifier_dct = {"externalId": self.external_id}
+            self.identifier_type = "externalId"
+            self.identifier = self.external_id
         else:
             raise ValueError("Pass exactly one of `id` or `external_id`. Got neither.")
+        # Needed for hashing and api queries:
+        self.identifier_tpl = (self.identifier_type, self.identifier)
+        self.identifier_dct = {self.identifier_type: self.identifier}
 
     def _verify_limit(self):
         if self.limit in {None, -1, math.inf}:
@@ -277,21 +290,19 @@ def align_with_granularity_unit(ts: int, granularity: str, is_end: bool):
     return ts - ts % gms + is_end*gms
 
 
-def find_count_granularity_for_agg_query(start: int, end: int, granularity: str, limit: Optional[int]):
-    print(f"TODO: Ignoring {limit=}. If low, like 50, we know a single request will do.")
+def find_count_granularity_for_query(
+    start: int, end: int, granularity: str, limit: Optional[int], dps_api_limit: int
+) -> Tuple[int, str]:
     td = end - start
-    if limit is None:
+    if limit is not None:
+        max_dps = limit
+    else:
         # If every single period of aggregate dps exist, we get a maximum number of dps:
         max_dps = max(1, td / granularity_to_ms(granularity))
-    elif limit <= 10_000:
-        # We can fetch everything in one request, so count agg request is pointless.
-        max_dps = 1
-    else:  # 10k < limit < inf
-        max_dps = limit
 
-    # We want to parallelize requests, each maxing out at 10k dps. When asking for all the
-    # `count` aggregates, we want to speed this up by grouping 10 time series, thus allowing >1k each:
-    n_timedeltas = min(1000, math.ceil(max_dps / 10_000))  # This is the `limit`
+    # We want to parallelize requests, each maxing out at `dps_api_limit`. When asking for all the
+    # `count` aggregates, we want to speed this up by grouping time series (thus we cap at 1k):
+    n_timedeltas = min(1000, math.ceil(max_dps / dps_api_limit))  # This will become the `limit`
     gran_ms = min(td, td / n_timedeltas)
     if gran_ms < 120 * TIME_UNIT_IN_MS["s"]:
         n = math.ceil(gran_ms / TIME_UNIT_IN_MS["s"])
@@ -330,14 +341,16 @@ def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
 
 
 def single_datapoints_api_call(client, payload):
-    return client.datapoints._post(client.datapoints._RESOURCE_PATH + "/list", json=payload).json()["items"]
+    return (
+        client.datapoints._post(client.datapoints._RESOURCE_PATH + "/list", json=payload).json()
+    )["items"]
 
 
 def build_count_query_payload(queries):
     return {
         "aggregates": ["count"],
         "ignoreUnknownIds": True,  # Avoids a potential extra query
-        "items": [q.get_count_agg_parameters() for q in queries],
+        "items": [q.get_count_query_params() for q in queries],
     }
 
 
@@ -346,12 +359,14 @@ def handle_missing_ts(res, queries):
     not_missing = {("id", r["id"]) for r in res}.union(("externalId", r["externalId"]) for r in res)
     for q in queries:
         q.is_missing = q.identifier_tpl not in not_missing
-        # We might be handling multiple simultaneous top-level queries, each with
-        # different settings for "ignore unknown":
-        if q.is_missing and not q.ignore_unknown_ids:
-            missing.append(q.identifier_dct)
-    if missing:
+        if q.is_missing:
+            missing.append(q)
+    # We might be handling multiple simultaneous top-level queries, each with
+    # different settings for "ignore unknown":
+    missing_to_raise = [q.identifier_dct for q in missing if q.is_missing and not q.ignore_unknown_ids]
+    if missing_to_raise:
         raise CogniteNotFoundError(not_found=missing)
+    return [q for q in queries if not q.is_missing], missing
 
 
 def handle_string_ts(string_ts, queries):
@@ -367,65 +382,120 @@ def handle_string_ts(string_ts, queries):
         ) from None
 
 
-# @dataclass
-# class Task:
-#     function: Callable
-#     args: Tuple[object, ...]
-#     kwargs: Mapping[str, object]
-#
-#     def execute(self):
-#         return self.function(*args, **kwargs)
-
-
 def get_is_string_property(client, queries):
     # We do not know if duplicates exist between those given by `id` and `external_id`.
     # Quick fix is to send two separate queries ಠಿ_ಠ
-    # TODO(haakonvt): Not finished. Want to parallelize these calls for sure
-    ids = list(set(q.identifier_tpl[1] for q in queries if q.identifier_tpl[0] == "id"))
-    xids = list(set(q.identifier_tpl[1] for q in queries if q.identifier_tpl[0] == "externalId"))
-    ids_ts = client.time_series.retrieve_multiple(ids=ids, ignore_unknown_ids=True)
-    xids_ts = client.time_series.retrieve_multiple(external_ids=xids, ignore_unknown_ids=True)
+    futures = []
+    # TODO(haakonvt): Dont really want another TPE inside here:
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for identifier_type in ["id", "externalId"]:
+            items = set(q.identifier for q in queries if q.identifier_type == identifier_type)
+            # Note: We do not call client.time_series.retrieve_multiple since it spins up
+            # a separate thread pool:
+            future = pool.submit(
+                client.time_series._post,
+                url_path="/timeseries/byids",
+                json={
+                    "items": [{identifier_type: itm} for itm in items],
+                    "ignoreUnknownIds": True
+                }
+            )
+            futures.append(future)
     return {
-        "id": {ts.id for ts in ids_ts if ts.is_string},
-        "externalId": {ts.external_id for ts in xids_ts if ts.is_string},
+        "id": {ts["id"] for ts in futures[0].result().json()["items"] if ts["isString"]},
+        "externalId": {ts["externalId"] for ts in futures[1].result().json()["items"] if ts["isString"]},
     }
 
 
-def create_tasks_from_counts(client, queries, counts):
+def remove_string_ts(client, queries, items):
+    string_ts = get_is_string_property(client, queries)
+    handle_string_ts(string_ts, queries)
+    keep = {q.identifier_tpl for q in queries if not q.is_string}
+    keep_items = [
+        ic for ic in items
+        # TODO: Can time series have external_id=None? Might need ic.get("xid", NOT_NONE)
+        if ("id", ic.get("id")) in keep or ("externalId", ic.get("externalId")) in keep
+    ]
+    string_qs = [q for q in queries if q.is_string]
+    queries = [q for q in queries if not q.is_string]
+    return keep_items, queries, string_qs
+
+
+def get_available_counts(client, queries, counts):
     try:
+        res, string_qs = [], []
         res = single_datapoints_api_call(client, counts)
-        handle_missing_ts(res, queries)
-        return res
     except CogniteAPIError as e:
-        print(f"{e!r}")
-        if e.code == 400:
-            # Likely: "Aggregates are not supported for string time series"
-            string_ts = get_is_string_property(client, queries)
-            handle_string_ts(string_ts, queries)
-            query_subset = [q for q in queries if not q.is_string]
-            if not query_subset:
-                return []  # All ts are string
-            keep_identifiers = {q.identifier_tpl for q in query_subset}
-            keep_items = [
-                ic for ic in counts["items"]
-                if ("id", ic.get("id")) in keep_identifiers
-                or ("externalId", ic.get("externalId")) in keep_identifiers
-            ]
-            print(f"{query_subset = }")
-            print(f"{keep_identifiers = }")
-            print(f"{keep_items = }")
-            print('{**counts, "items": keep_items} = ', {**counts, "items": keep_items})
-            input("here again??\n\n")
-            return create_tasks_from_counts(client, query_subset, {**counts, "items": keep_items})
-        print(f"{e!r}")
-        pprint(vars(e))
-        raise
+        # Note: We do not get '400-IDs not found', because count-query uses 'ignore unknown'
+        if e.code != 400:
+            raise
+        # Likely: "Aggregates are not supported for string time series"
+        keep_items, queries, string_qs = remove_string_ts(client, queries, counts["items"])
+        if keep_items:
+            res = single_datapoints_api_call(client, {**counts, "items": keep_items})
+
+    # With string-ts removed, we can assume any still missing as not-existing:
+    queries, missing = handle_missing_ts(res, queries)
+    return queries, string_qs, missing, res
+
+
+def generate_string_ts_tasks(queries):
+    tasks = []
+    #TODO(haakonvt): Do something a little more fancy for string ts...
+    for q in queries:
+        pprint(q)
+    return tasks
+
+
+def create_tasks_from_counts(client, queries, counts):
+    # print(f"\nALL PARSED TS:\n {pformat(sorted({q.identifier_tpl for q in queries}), indent=4, width=135, sort_dicts=False)}")
+    queries, string_qs, missing, res = get_available_counts(client, queries, counts)
+    # print(f"\nINFERRED STRING TS:\n{pformat(sorted({q.identifier_tpl for q in string_qs}), indent=4, width=135, sort_dicts=False)}")
+    # print(f"\nINFERRED MISSING TS:\n{pformat(sorted({q.identifier_tpl for q in missing}), indent=4, width=135, sort_dicts=False)}")
+    # print(f"\nAFTER REMOVING MISSING TS:\n{pformat(sorted({q.identifier_tpl for q in queries}), indent=4, width=135, sort_dicts=False)}")
+
+    # Create dps fetch tasks for string first (since we cannot parallelize fetching cleverly with counts):
+    tasks = generate_string_ts_tasks(string_qs)
+    input("...")
+
+
+
+
+
+# >>> import heapq
+# >>> list(heapq.merge([1,2,3], [0,4]), key=None)
+# [0, 1, 2, 3, 4]
+
+# def merge_no_dupes(*args):
+#     last = object()
+#     for next in heapq.merge(*args):
+#         if next != last:  # remove duplicates
+#             last = next
+#             yield a
+#
+# list(merge_no_dupes(([1,2], [0,2])))
+
+class DpsTaskEnum(enum.Enum):
+    CREATE_TASKS = enum.auto()
+    DATAPOINTS = enum.auto()
+
+
+@dataclass
+class DpsTask:
+    task: Tuple[Callable, List[Any], Dict[str, Any]]
+    task_type: DpsTaskEnum
+
+
+class DpsFetchOrchestrator:
+    def __init__(self):
+        self.data = {}
 
 
 def count_based_task_splitting(query_lst, client, max_workers=10):
+    dps_orchestrator = DpsFetchOrchestrator()
     # Set up pool using `max_workers` using at least 1 thread:
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
-        futures = []
+        futures_dct = {}
         for queries in (query_lst.raw_queries, query_lst.aggregate_queries):
             if not queries:
                 continue
@@ -434,20 +504,37 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             # Smash together as many of the count-aggregate requets as possible:
             for count_chunk in chunk_queries_to_allowed_limits(count_tasks):
                 qs_chunk = list(itertools.islice(qs_it, len(count_chunk["items"])))
-                futures.append(pool.submit(create_tasks_from_counts, client, qs_chunk, count_chunk))
+                future = pool.submit(create_tasks_from_counts, client, qs_chunk, count_chunk)
+                futures_dct[future] = DpsTaskEnum.CREATE_TASKS
 
-            for task in as_completed(futures):
-                print("Calling .result() in 1")
-                import time
-                time.sleep(1)
-                print(f"{task.result() = }")
-            # while futures:
-            #     new_futures = []
+        while futures_dct:
+            new_futures_dct = {}
+            # Queue up new work as soon as possible by using `as_completed`:
+            for future in as_completed(futures_dct):
+                res = future.result()
+                task_type = futures_dct[future]
+                if task_type is DpsTaskEnum.CREATE_TASKS:
+                    new_tasks = res
+                elif task_type is DpsTaskEnum.DATAPOINTS:
+                    new_tasks = dps_orchestrator.handle_and_create_tasks_from_new_dps(res)
+                else:
+                    raise ValueError(f"Task type not understood, expected {DpsTaskEnum}, not {task_type}")
+
+                for new_task in new_tasks:
+                    future = pool.submit(*new_task)
+                    new_futures_dct[future] = new_task.task_type
+                # Swap
+                futures_dct = new_futures_dct
+
+            print("Calling .result() in 1")
+            print(f"{future.result() = }")
+            # while futures_dct:
+            #     new_futures_dct = {}
             #     # Queue up new work as soon as possible by using `as_completed`:
-            #     for task in as_completed(futures):
-            #         new_futures.append(all_new_tasks)
+            #     for future in as_completed(futures_dct):
+            #         new_futures_dct.append(all_new_tasks)
             #
-            #     futures = new_futures
+            #     futures_dct = new_futures_dct
 
 
 if __name__ == "__main__":
@@ -461,20 +548,22 @@ if __name__ == "__main__":
     INCLUDE_OUTSIDE_POINTS = None
     LIMIT = None
     IGNORE_UNKNOWN_IDS = True
-    IGNORE_UNKNOWN_IDS = False
+    # IGNORE_UNKNOWN_IDS = False
     ID = None
     ID = [
+        {"id": 226740051491},
         {"id": 2546012653669},  # string
+        {"id": 1111111111111},  # prob missing...
         # {"id": 2546012653669, "aggregates": ["max", "average"], "granularity": "1d"},  # string
     ]
     EXTERNAL_ID = [
-        # {"limit": None, "external_id": "ts-test-#01-daily-111/650"},
+        {"limit": None, "external_id": "ts-test-#01-daily-111/650"},
         {"limit": None, "external_id": "ts-test-#01-daily-222/650"},
-        # {"limit": None, "external_id": "ts-test-#01-daily-651/650"},
+        {"limit": None, "external_id": "ts-test-#01-daily-64/650"},
+        {"limit": None, "external_id": "ts-test-#01-daily-444/650"},
         {"limit": None, "external_id": "8400074_destination"},  # string
         {"limit": None, "external_id": "9624122_cargo_type"},  # string
-        # {"limit": None, "external_id": "ts-test-#01-daily-64/650"},
-        # {"limit": None, "external_id": "ts-test-#01-daily-444/650"},
+        {"limit": None, "external_id": "ts-test-#01-daily-651/650"},  # missing
     ]
     query = NewDatapointsQuery(
         start=START,
