@@ -21,9 +21,9 @@ class DatapointsAPI(APIClient):
         print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
         print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
         super().__init__(*args, **kwargs)
-        self._DPS_LIMIT_AGG = 10000
-        self._DPS_LIMIT = 100000
-        self._POST_DPS_OBJECTS_LIMIT = 10000
+        self._DPS_LIMIT_AGG = 10_000
+        self._DPS_LIMIT = 100_000
+        self._POST_DPS_OBJECTS_LIMIT = 10_000
         self._RETRIEVE_LATEST_LIMIT = 100
         self.synthetic = SyntheticDatapointsAPI(
             self._config, api_version=self._api_version, cognite_client=self._cognite_client
@@ -246,8 +246,8 @@ class DatapointsAPI(APIClient):
     def insert(
         self,
         datapoints: Union[
-            List[Dict[Union[int, float, datetime], Union[int, float, str]]],
-            List[Tuple[Union[int, float, datetime], Union[int, float, str]]],
+            List[Dict[Union[float, datetime], Union[float, str]]],
+            List[Tuple[Union[float, datetime], Union[float, str]]],
         ],
         id: int = None,
         external_id: str = None,
@@ -742,8 +742,8 @@ class DatapointsPoster:
     @staticmethod
     def _validate_and_format_datapoints(
         datapoints: Union[
-            List[Dict[Union[int, float, datetime], Union[int, float, str]]],
-            List[Tuple[Union[int, float, datetime], Union[int, float, str]]],
+            List[Dict[Union[float, datetime], Union[float, str]]],
+            List[Tuple[Union[float, datetime], Union[float, str]]],
         ],
     ) -> List[Tuple[int, Any]]:
         utils._auxiliary.assert_type(datapoints, "datapoints", [list])

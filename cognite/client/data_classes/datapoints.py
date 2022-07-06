@@ -12,8 +12,8 @@ class Datapoint(CogniteResource):
     """An object representing a datapoint.
 
     Args:
-        timestamp (Union[int, float]): The data timestamp in milliseconds since the epoch (Jan 1, 1970).
-        value (Union[str, int, float]): The data value. Can be String or numeric depending on the metric
+        timestamp (float): The data timestamp in milliseconds since the epoch (Jan 1, 1970).
+        value (Union[str, float]): The data value. Can be String or numeric depending on the metric
         average (float): The integral average value in the aggregate period
         max (float): The maximum value in the aggregate period
         min (float): The minimum value in the aggregate period
@@ -28,8 +28,8 @@ class Datapoint(CogniteResource):
 
     def __init__(
         self,
-        timestamp: Union[int, float] = None,
-        value: Union[str, int, float] = None,
+        timestamp: float = None,
+        value: Union[str, float] = None,
         average: float = None,
         max: float = None,
         min: float = None,
@@ -82,8 +82,8 @@ class Datapoints:
         is_string (bool): Whether the time series is string valued or not.
         is_step (bool): Whether the time series is a step series or not.
         unit (str): The physical unit of the time series.
-        timestamp (List[Union[int, float]]): The data timestamps in milliseconds since the epoch (Jan 1, 1970).
-        value (List[Union[int, str, float]]): The data values. Can be String or numeric depending on the metric
+        timestamp (List[float]): The data timestamps in milliseconds since the epoch (Jan 1, 1970).
+        value (List[Union[str, float]]): The data values. Can be String or numeric depending on the metric
         average (List[float]): The integral average values in the aggregate period
         max (List[float]): The maximum values in the aggregate period
         min (List[float]): The minimum values in the aggregate period
@@ -103,8 +103,8 @@ class Datapoints:
         is_string: bool = None,
         is_step: bool = None,
         unit: str = None,
-        timestamp: List[Union[int, float]] = None,
-        value: List[Union[int, str, float]] = None,
+        timestamp: List[float] = None,
+        value: List[Union[str, float]] = None,
         average: List[float] = None,
         max: List[float] = None,
         min: List[float] = None,

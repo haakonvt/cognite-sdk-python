@@ -450,8 +450,8 @@ class SequencesDataAPI(APIClient):
     def insert(
         self,
         rows: Union[
-            Dict[int, List[Union[int, float, str]]],
-            List[Tuple[int, Union[int, float, str]]],
+            Dict[int, List[Union[float, str]]],
+            List[Tuple[int, Union[float, str]]],
             List[Dict[str, Any]],
             SequenceData,
         ],
@@ -463,7 +463,7 @@ class SequencesDataAPI(APIClient):
 
         Args:
             column_external_ids (Optional[List[str]]): List of external id for the columns of the sequence.
-            rows (Union[ Dict[int, List[Union[int, float, str]]], List[Tuple[int,Union[int, float, str]]], List[Dict[str,Any]], SequenceData]):  The rows you wish to insert.
+            rows (Union[ Dict[int, List[Union[float, str]]], List[Tuple[int,Union[float, str]]], List[Dict[str,Any]], SequenceData]):  The rows you wish to insert.
                 Can either be a list of tuples, a list of {"rowNumber":... ,"values": ...} objects, a dictionary of rowNumber: data, or a SequenceData object. See examples below.
             id (int): Id of sequence to insert rows into.
             external_id (str): External id of sequence to insert rows into.

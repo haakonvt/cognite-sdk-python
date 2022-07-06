@@ -279,7 +279,7 @@ class SequenceData:
         external_id (str): External id of the sequence the data belong to
         rows (List[dict]): Combined row numbers and row data object from the API. If you pass this, row_numbers/values are ignored.
         row_numbers (List[int]): The data row numbers.
-        values (List[List[ Union[int, str, float]]]): The data values, one row at a time.
+        values (List[List[ Union[str, float]]]): The data values, one row at a time.
         columns: List[dict]: The column information, in the format returned by the API.
     """
 
@@ -289,7 +289,7 @@ class SequenceData:
         external_id: str = None,
         rows: List[dict] = None,
         row_numbers: List[int] = None,
-        values: List[List[Union[int, str, float]]] = None,
+        values: List[List[Union[str, float]]] = None,
         columns: List[dict] = None,
     ):
         if rows:
@@ -319,20 +319,20 @@ class SequenceData:
             and self.values == other.values
         )
 
-    def __getitem__(self, item: int) -> List[Union[int, str, float]]:
+    def __getitem__(self, item: int) -> List[Union[str, float]]:
         # slow, should be replaced by dict cache if it sees more than incidental use
         if isinstance(item, slice):
             raise TypeError("Slicing SequenceData not supported")
         return self.values[self.row_numbers.index(item)]
 
-    def get_column(self, external_id: str) -> List[Union[int, str, float]]:
+    def get_column(self, external_id: str) -> List[Union[str, float]]:
         """Get a column by external_id.
 
         Args:
             external_id (str): External id of the column.
 
         Returns:
-            List[Union[int, str, float]]: A list of values for that column in the sequence
+            List[Union[str, float]]: A list of values for that column in the sequence
         """
         try:
             ix = self.column_external_ids.index(external_id)
@@ -342,7 +342,7 @@ class SequenceData:
             )
         return [r[ix] for r in self.values]
 
-    def items(self) -> Generator[Tuple[int, List[Union[int, str, float]]], None, None]:
+    def items(self) -> Generator[Tuple[int, List[Union[str, float]]], None, None]:
         """Returns an iterator over tuples of (row number, values)."""
         for row, values in zip(self.row_numbers, self.values):
             yield row, values

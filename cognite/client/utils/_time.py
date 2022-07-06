@@ -21,11 +21,11 @@ def datetime_to_ms(dt):
     return int(1000 * dt.timestamp())
 
 
-def ms_to_datetime(ms: Union[int, float]) -> datetime:
+def ms_to_datetime(ms: float) -> datetime:
     """Converts milliseconds since epoch to datetime object.
 
     Args:
-        ms (Union[int, float]): Milliseconds since epoch
+        ms (float): Milliseconds since epoch
 
     Returns:
         datetime: Datetime object.
@@ -74,11 +74,11 @@ def time_ago_to_ms(time_ago_string: str) -> int:
     return ms
 
 
-def timestamp_to_ms(timestamp: Union[int, float, str, datetime]) -> int:
+def timestamp_to_ms(timestamp: Union[float, str, datetime]) -> int:
     """Returns the ms representation of some timestamp given by milliseconds, time-ago format or datetime object
 
     Args:
-        timestamp (Union[int, float, str, datetime]): Convert this timestamp to ms.
+        timestamp (Union[float, str, datetime]): Convert this timestamp to ms.
 
     Returns:
         int: Milliseconds since epoch representation of timestamp
