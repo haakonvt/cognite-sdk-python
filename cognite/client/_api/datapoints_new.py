@@ -1,27 +1,43 @@
 from __future__ import annotations
-from abc import ABC
-from pprint import pprint, pformat
+# from abc import ABC
+from pprint import pprint, pformat  # noqa
 import math
 import numbers
-from typing import List, Union, Optional, Dict, NoReturn
-from functools import partial, cached_property
+import operator as op
+from typing import List, Union, Optional, Dict, NoReturn, Tuple
+from functools import cached_property
 from datetime import datetime
 import enum
 import dataclasses
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, InitVar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 # from timeit import default_timer as timer
 
+from cognite.client._api.datapoints_extra import (
+    align_window_start_and_end,
+    find_count_granularity_for_query,
+    chunk_queries_to_allowed_limits,
+    single_datapoints_api_call,
+    build_count_query_payload,
+    handle_missing_ts,
+    handle_string_ts,
+    get_is_string_property,
+    remove_string_ts,
+)
+from cognite.client._api.datapoints import DatapointsAPI
 from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms, granularity_unit_to_ms
 from cognite.client.data_classes import DatapointsQuery
 from cognite.client.exceptions import CogniteAPIError, CogniteNotFoundError
 from cognite.client.utils._auxiliary import to_camel_case
 
-print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
-print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
+print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
+print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
 
 TIME_UNIT_IN_MS = {"s": 1000, "m": 60000, "h": 3600000, "d": 86400000}
+
+# Notes list
+# - Union[int, float] is the same as `float`.
 
 # TODO list
 # - Should be a special method named "retrieve_string_datapoints"
@@ -34,13 +50,15 @@ TIME_UNIT_IN_MS = {"s": 1000, "m": 60000, "h": 3600000, "d": 86400000}
 # - Try to break current "count-based" for aggregate-queries with some dense dps with at least 10k dps/day
 #   using i.e. "25h" or higher as granularity
 # - Fetch 10_001 aggs or 100_001 raw dps
+# - client.datapoints.query() with a bunch of small queries
 
 # Question list
-# - Why fetch count aggregate for aggregates-queries?
+# - Why fetch count aggregate for aggregates-queries? Just to pick up potential empty periods?
 
 
 class NewDatapointsQuery(DatapointsQuery):
     def __init__(self, *args, **kwargs):
+        self.client = kwargs.pop("client")
         super().__init__(*args, **kwargs)
         self.defaults = dict(
             start=self.start,  # Optional. Default: 1970-01-01
@@ -89,11 +107,11 @@ class NewDatapointsQuery(DatapointsQuery):
         queries = []
         for ts in id_or_xid:
             if isinstance(ts, exp_type):
-                queries.append(TSQuery.from_dict_with_validation({arg_name: ts}, defaults=self.defaults))
+                queries.append(TSQuery.from_dict_with_validation({arg_name: ts}, self.client, self.defaults))
 
             elif isinstance(ts, dict):
                 ts_validated = self._validate_ts_query_dct(ts, arg_name, exp_type)
-                queries.append(TSQuery.from_dict_with_validation(ts_validated, defaults=self.defaults))
+                queries.append(TSQuery.from_dict_with_validation(ts_validated, self.client, self.defaults))
             else:
                 self._raise_on_wrong_ts_identifier_type(ts, arg_name, exp_type)
         return queries
@@ -152,6 +170,7 @@ class TSQueryList:
 
 @dataclass
 class TSQuery:
+    client: InitVar[DatapointsAPI]
     id: Optional[int] = None
     external_id: Optional[str] = None
     start: Union[int, str, datetime, None] = None
@@ -163,47 +182,24 @@ class TSQuery:
     ignore_unknown_ids: Optional[bool] = None
 
     def __post_init__(self):
+        self._DPS_LIMIT_AGG = self.client._DPS_LIMIT_AGG
+        self._DPS_LIMIT = self.client._DPS_LIMIT
+        del self.client
         self._is_missing = None  # I.e. not set...
         self._is_string = None  # ...or unknown
         self._verify_time_range()
         self._verify_limit()
         self._verify_identifier()
 
-    def __eq__(self, other):
-        if isinstance(other, TSQuery):
-            return self.to_tuple() == other.to_tuple()
-        return NotImplemented
-
-    def __hash__(self):
-        return hash(self.to_tuple())
-
-    def to_tuple(self):
-        aggregates = self.aggregates
-        if aggregates is not None:
-            aggregates = tuple(self.aggregates)  # Hashable is pri 1
-        return (
-            self.id,
-            self.external_id,
-            self.start,
-            self.end,
-            self.granularity,
-            self.include_outside_points,
-            self.limit,
-            aggregates,
-            self.ignore_unknown_ids,
-        )
-
     def get_count_query_params(self):
         if self.is_raw_query:
             # With a maximum of millisecond resolution, we peak at 1k dps/sec. Realistically
             # though, most time series are far less dense. We make a guess of '1s' (prob too high even):
             granularity = "1s"  # TODO: Can be tweaked with real-world data?
-            dps_api_limit = 100_000
         else:  # Aggregates have at most 1 dp/gran (and maxes out at 1 dp/sec):
             granularity = self.granularity
-            dps_api_limit = 10_000
         limit, count_gran = find_count_granularity_for_query(
-            self.start, self.end, granularity, self.limit, dps_api_limit,
+            self.start, self.end, granularity, self.limit, self.max_query_limit,
         )
         return {
             **self.identifier_dct,
@@ -216,13 +212,13 @@ class TSQuery:
     def _verify_identifier(self):
         if self.id is not None:
             self.identifier_type = "id"
-            self.identifier = self.id
+            self.identifier = int(self.id)
         elif self.external_id is not None:
             self.identifier_type = "externalId"
-            self.identifier = self.external_id
+            self.identifier = str(self.external_id)
         else:
             raise ValueError("Pass exactly one of `id` or `external_id`. Got neither.")
-        # Needed for hashing and api queries:
+        # Shortcuts for hashing and API queries:
         self.identifier_tpl = (self.identifier_type, self.identifier)
         self.identifier_dct = {self.identifier_type: self.identifier}
 
@@ -276,11 +272,11 @@ class TSQuery:
     @property
     def max_query_limit(self):
         if self.is_raw_query:
-            return 100_000
-        return 10_000
+            self._DPS_LIMIT  # 100k
+        return self._DPS_LIMIT_AGG  # 10k
 
     @classmethod
-    def from_dict_with_validation(cls, ts_dct, defaults) -> TSQuery:
+    def from_dict_with_validation(cls, ts_dct, client, defaults) -> TSQuery:
         # We merge 'defaults' and given ts-dict, ts-dict takes precedence:
         dct = {**defaults, **ts_dct}
         granularity, aggregates = dct["granularity"], dct["aggregates"]
@@ -308,229 +304,13 @@ class TSQuery:
         return cls(**dct)  # Request for one or more aggregates
 
     def __repr__(self):
-        # TODO(haakonvt): REMOVE
+        # TODO(haakonvt): Remove
         s = ", ".join(
             f'{field.name}={getattr(self, field.name)!r}'
             for field in dataclasses.fields(self)
-            if getattr(self, field.name) is not None
+            if field.name == "limit" or getattr(self, field.name) is not None
         )
         return f'{type(self).__name__}({s})'
-
-
-# def sequence_split_gen(seq, n):
-#     yield from (seq[i:i + n] for i in range(0, len(seq), n))
-
-
-def align_window_start_and_end(start: int, end: int, granularity: str) -> Tuple[int, int]:
-    # Note the API always aligns start with 1s, 1m, 1h or 1d (even when given e.g. 73h)
-    remainder = start % granularity_unit_to_ms(granularity)
-    if remainder:
-        # Floor `start` when not exactly at boundary
-        start -= remainder
-    gms = granularity_to_ms(granularity)
-    remainder = (end - start) % gms
-    if remainder:
-        # Ceil `end` when not exactly at boundary
-        end += gms - remainder
-    return start, end
-
-
-def find_count_granularity_for_query(
-    start: int, end: int, granularity: str, limit: Optional[int], dps_api_limit: int
-) -> Tuple[int, str]:
-    td = end - start
-    if limit is not None:
-        max_dps = limit
-    else:
-        # If every single period of aggregate dps exist, we get a maximum number of dps:
-        max_dps = max(1, td / granularity_to_ms(granularity))
-
-    # We want to parallelize requests, each maxing out at `dps_api_limit`. When asking for all the
-    # `count` aggregates, we want to speed this up by grouping time series (thus we cap at 1k):
-    n_timedeltas = min(1000, math.ceil(max_dps / dps_api_limit))  # This will become the `limit`
-    gran_ms = min(td, td / n_timedeltas)
-    if gran_ms < 120 * TIME_UNIT_IN_MS["s"]:
-        n = math.ceil(gran_ms / TIME_UNIT_IN_MS["s"])
-        return n_timedeltas, f"{n}s",
-
-    elif gran_ms < 120 * TIME_UNIT_IN_MS["m"]:
-        n = math.ceil(gran_ms / TIME_UNIT_IN_MS["m"])
-        return n_timedeltas, f"{n}m",
-
-    elif gran_ms < 100_000 * TIME_UNIT_IN_MS["h"]:
-        n = math.ceil(gran_ms / TIME_UNIT_IN_MS["h"])
-        return n_timedeltas, f"{n}h",
-
-    elif gran_ms < 100_000 * TIME_UNIT_IN_MS["d"]:
-        n = math.ceil(gran_ms / TIME_UNIT_IN_MS["d"])
-        return n_timedeltas, f"{n}d",
-    else:
-        # Not possible with current TimeSeriesAPI in v1. To futureproof for potential increase
-        # of time range, we return max granularity and an a wild overestimate of required time windows:
-        return 1000, "100000d"  # 274k years. Current API limit is 80 years...
-
-
-def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
-    chunk, n_items, n_dps = [], 0, 0
-    for item in payload.pop("items"):
-        # If limit not given per item, we require default to exist (if not, raise KeyError):
-        dps_limit = item.get("limit", payload["limit"])
-        if dps_limit is None:  # Need explicit None-check because falsy 0 is an allowed limit
-             dps_limit = max_dps
-        if n_items + 1 > max_items or n_dps + dps_limit > max_dps:
-            yield {**payload, "items": chunk}
-            chunk, n_items, n_dps = [], 0, 0
-        chunk.append(item)
-        n_items += 1
-        n_dps += dps_limit
-    if chunk:
-        yield {**payload, "items": chunk}
-
-
-def single_datapoints_api_call(client, payload):
-    return (
-        client.datapoints._post(client.datapoints._RESOURCE_PATH + "/list", json=payload).json()
-    )["items"]
-
-
-def build_count_query_payload(queries):
-    return {
-        "aggregates": ["count"],
-        "ignoreUnknownIds": True,  # Avoids a potential extra query
-        "items": [q.get_count_query_params() for q in queries],
-    }
-
-
-def handle_missing_ts(res, queries):
-    missing = []
-    not_missing = {("id", r["id"]) for r in res}.union(("externalId", r["externalId"]) for r in res)
-    for q in queries:
-        q.is_missing = q.identifier_tpl not in not_missing
-        if q.is_missing:
-            missing.append(q)
-    # We might be handling multiple simultaneous top-level queries, each with
-    # different settings for "ignore unknown":
-    missing_to_raise = [q.identifier_dct for q in missing if q.is_missing and not q.ignore_unknown_ids]
-    if missing_to_raise:
-        raise CogniteNotFoundError(not_found=missing)
-    return [q for q in queries if not q.is_missing], missing
-
-
-def handle_string_ts(string_ts, queries):
-    not_supported_qs = []
-    for q in queries:
-        id_type, identifier = q.identifier_tpl
-        q.is_string = identifier in string_ts[id_type]
-        if q.is_string and not q.is_raw_query:
-            not_supported_qs.append(q.identifier_dct)
-    if not_supported_qs:
-        raise ValueError(
-            f"Aggregates are not supported for string time series: {not_supported_qs}"
-        ) from None
-
-
-def get_is_string_property(client, queries):
-    # We do not know if duplicates exist between those given by `id` and `external_id`.
-    # Quick fix is to send two separate queries ಠಿ_ಠ
-    futures = []
-    # TODO(haakonvt): Dont really want another TPE inside here:
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        for identifier_type in ["id", "externalId"]:
-            items = set(q.identifier for q in queries if q.identifier_type == identifier_type)
-            # Note: We do not call client.time_series.retrieve_multiple since it spins up
-            # a separate thread pool:
-            future = pool.submit(
-                client.time_series._post,
-                url_path="/timeseries/byids",
-                json={
-                    "items": [{identifier_type: itm} for itm in items],
-                    "ignoreUnknownIds": True
-                }
-            )
-            futures.append(future)
-    return {
-        "id": {ts["id"] for ts in futures[0].result().json()["items"] if ts["isString"]},
-        "externalId": {ts["externalId"] for ts in futures[1].result().json()["items"] if ts["isString"]},
-    }
-
-
-def remove_string_ts(client, queries, items):
-    string_ts = get_is_string_property(client, queries)
-    handle_string_ts(string_ts, queries)
-    keep = {q.identifier_tpl for q in queries if not q.is_string}
-    keep_items = [
-        ic for ic in items
-        # TODO: Can time series have external_id=None? Might need ic.get("xid", NOT_NONE)
-        if ("id", ic.get("id")) in keep or ("externalId", ic.get("externalId")) in keep
-    ]
-    string_qs = [q for q in queries if q.is_string]
-    queries = [q for q in queries if not q.is_string]
-    return keep_items, queries, string_qs
-
-
-def get_available_counts(client, queries, count_query):
-    try:
-        res, string_qs = [], []
-        res = single_datapoints_api_call(client, count_query)
-    except CogniteAPIError as e:
-        # Note: We do not get '400-IDs not found', because count-query uses 'ignore unknown'
-        if e.code != 400:
-            raise
-        # Likely: "Aggregates are not supported for string time series"
-        keep_items, queries, string_qs = remove_string_ts(client, queries, count_query["items"])
-        if keep_items:
-            res = single_datapoints_api_call(client, {**count_query, "items": keep_items})
-
-    # With string-ts removed, we can assume any still missing as not-existing:
-    queries, missing = handle_missing_ts(res, queries)
-    return queries, string_qs, missing, res
-
-
-def generate_string_ts_tasks(queries):
-    print("NotImplemented: generate_string_ts_tasks")
-    tasks = []
-    return tasks
-
-
-def _create_single_fetch_task(query):
-    dps_limit = query.limit
-    if dps_limit is None:
-        dps_limit = query.max_query_limit
-    return (
-        DpsTask(identifier_dct=query.identifier_dct, start=query.start, end=query.start, limit=dps_limit),
-        DpsTaskType.DATAPOINTS,
-    )
-
-
-def generate_ts_tasks(queries, res):
-    tasks = []
-    for qq, rr in zip(queries, res):
-        assert rr[qq.identifier_type] == qq.identifier, "Counts belong to wrong time series."
-        counts = rr["datapoints"]
-        approx_tot = sum(dp["count"] for dp in counts)
-        if approx_tot < qq.max_query_limit:
-            # We are expecting full fetch in a single request
-            tasks.append(_create_single_fetch_task(qq))
-        print(f"{qq.identifier=}, {len(counts)}, {approx_tot=}")
-    return tasks
-
-
-def create_tasks_from_counts(client, queries, count_query):
-    # print(f"\nALL PARSED TS:\n {pformat(sorted({q.identifier_tpl for q in queries}), indent=4, width=135, sort_dicts=False)}")
-    queries, string_qs, missing, counts_dps = get_available_counts(client, queries, count_query)
-    # print(f"\nINFERRED STRING TS:\n{pformat(sorted({q.identifier_tpl for q in string_qs}), indent=4, width=135, sort_dicts=False)}")
-    # print(f"\nINFERRED MISSING TS:\n{pformat(sorted({q.identifier_tpl for q in missing}), indent=4, width=135, sort_dicts=False)}")
-    # print(f"\nAFTER REMOVING MISSING TS:\n{pformat(sorted({q.identifier_tpl for q in queries}), indent=4, width=135, sort_dicts=False)}")
-
-    # Create dps fetch tasks for string first (since we cannot parallelize fetching cleverly with counts):
-    tasks = []
-    if string_qs:
-        tasks.extend(generate_string_ts_tasks(string_qs))
-    if queries:
-        tasks.extend(generate_ts_tasks(queries, counts_dps))
-    print(f"{tasks = }")
-    input("...")
-    return tasks
 
 
 class DpsTaskType(enum.Enum):
@@ -539,40 +319,147 @@ class DpsTaskType(enum.Enum):
 
 
 @dataclass
-class DpsTask:
-    identifier_dct: Dict[str, Union[int, str]]
-    start: int
-    end: int
-    limit: int
+class BaseDpsTask:
+    # TODO: If python allows defining abstract dataclasses (easily) at some point, change this class:
+    #       https://github.com/python/mypy/issues/5374  (workaround too ugly lol)
+    query: TSQuery
+    client: DatapointsAPI
+
+
+@dataclass
+class SerialDpsTask(BaseDpsTask):
+    """A datapoints fetching task that executes in serial"""
 
     def __post_init__(self):
-        # A task can not have limit higher than API limit
-        assert self.limit is not None, "A DpsTask must have a specific `limit` (integer)"
+        self.is_done = False
+        self.n_dps_fetched = 0
+        self.is_first_query = True
+        self.next_start = self.query.start
+        self.dps_lsts: List[List[Tuple[Union[float, str], ...]]] = []
+        if self.query.is_raw_query:
+            self.offset_next = 1
+            self.unpack_fn = op.itemgetter("timestamp", "value")  # NB: timestamp must be first
+        else:
+            self.offset_next = granularity_to_ms(self.query.granularity)
+            self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
 
-    def create_payload_item(self):
-        return single_datapoints_api_call(client, payload)
+    def _create_payload_item(self, limit):
+        return {
+            **self.query.identifier_dct,
+            "start": self.next_start,
+            "end": self.query.end,
+            "aggregates": self.query.aggregates,
+            "granularity": self.query.granularity,
+            "includeOutsidePoints": self.query.include_outside_points,
+            "limit": limit,
+         }
+
+    def get_next_task(self):
+        if self.is_done:
+            return None
+        # if
+        limit = None
+        return self._create_payload_item(limit)
 
     def store_partial_result(self, res):
-        # Update internal status, like start/stop and if limit != None, dps left to fetch
-        ...
+        first_idx = 0
+        if self.query.include_outside_points and not self.is_first_query:
+            # For all queries -not the first-, we might need to chop off the first dp.
+            start_ts = res[0]["timestamp"]
+            prev_last_ts = self.n_dps_fetched[-1][-1][0]  # Timestamp is first entry
+            if start_ts == prev_last_ts:
+                first_idx = 1
+        self.is_first_query = False
 
+        last_idx = None
+        # TODO(haakonvt): Is this better moved to `get_next_task`?
+        if self.query.limit is not None:
+            n_dps_left = self.query.limit - self.n_dps_fetched
+            if n_dps_left < len(res) - first_idx:
+                last_idx = n_dps_left + first_idx
+
+        if first_idx or last_idx:
+            # List slices copies the ref. array; minor speedup using islice:
+            res = itertools.islice(res, first_idx, last_idx)
+        res = list(map(self.unpack_fn, res))
+        self.dps_lsts.append(res)
+        self.next_start = res[-1][0] + self.offset_next
+        self.n_dps_fetched += len(res)
+
+        self.is_done = ???? # TODO(haakonvt): ARE WE DONE?
+
+
+@dataclass
+class ParallelLimitedDpsTask(BaseDpsTask):
+    """A limited-fetch-datapoints task that executes in parallel. Tries to quit early"""
+
+
+@dataclass
+class ParallelUnlimitedDpsTask(BaseDpsTask):
+    """A fetch-all datapoints task that executes in parallel"""
 
 
 class DpsFetchOrchestrator:
-    def __init__(self, queries):
-        self.data_dct = {q: DpsTask(q) for q in queries}
+    def __init__(self, client):
+        self.client = client
 
-    # def map_to_query(self, res):
-    #     # We need to map incoming data to the correct query:
+    # "ignoreUnknownIds": False,  # If a ts is deleted while fetching, we want error instead of a part result
 
-    def handle_and_create_tasks_from_new_dps(queries, new_dps):
-        for q, dps in zip(queries, new_dps):
-            self.data_dct[q].store_partial_result(dps)
+    @staticmethod
+    def generate_string_ts_tasks(queries):
+        print("- NOT IMPLEMENTED: `generate_string_ts_tasks`")
+        tasks = []
+        return tasks
 
+    @staticmethod
+    def generate_ts_tasks(queries, res):
+        tasks = []
+        for q, r in zip(queries, res):
+            assert r[q.identifier_type] == q.identifier, "Counts belong to wrong time series."
+            counts = r["datapoints"]
+            approx_tot = sum(dp["count"] for dp in counts)
+            if approx_tot < q.max_query_limit:
+                # We are expecting a full fetch in a single request
+                tasks.append((SerialDpsTask(q), DpsTaskType.DATAPOINTS))
+        return tasks
+
+    def get_available_counts(self, queries, count_query):
+        try:
+            res, string_qs = [], []
+            res = single_datapoints_api_call(self.client, count_query)
+        except CogniteAPIError as e:
+            # Note: We do not get '400-IDs not found', because count-query uses 'ignore unknown'
+            if e.code != 400:
+                raise
+            # Likely: "Aggregates are not supported for string time series"
+            keep_items, queries, string_qs = remove_string_ts(self.client, queries, count_query["items"])
+            if keep_items:
+                res = single_datapoints_api_call(self.client, {**count_query, "items": keep_items})
+
+        # With string-ts removed, we can assume any still missing as not-existing:
+        queries, missing = handle_missing_ts(res, queries)
+        return queries, string_qs, missing, res
+
+    def create_tasks_from_counts(self, queries, count_query):
+        queries, string_qs, missing, counts_dps = self.get_available_counts(queries, count_query)
+
+        # Create dps fetch tasks for string first (since we cannot parallelize fetching cleverly with counts):
+        tasks = []
+        if string_qs:
+            tasks.extend(self.generate_string_ts_tasks(string_qs))
+        if queries:
+            tasks.extend(self.generate_ts_tasks(queries, counts_dps))
+        print(f"{tasks = }")
+        input("...")
+        return tasks
+
+    # def handle_and_create_tasks_from_new_dps(queries, new_dps):
+    #     for q, dps in zip(queries, new_dps):
+    #         self.data_dct[q].store_partial_result(dps)
 
 
 def count_based_task_splitting(query_lst, client, max_workers=10):
-    # dps_orchestrator = DpsFetchOrchestrator(query_lst)
+    dps_orchestrator = DpsFetchOrchestrator(client)
     # Set up pool using `max_workers` using at least 1 thread:
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
         futures_dct = {}
@@ -584,7 +471,7 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             # Smash together as many of the count-aggregate requets as possible:
             for count_task_chunk in chunk_queries_to_allowed_limits(count_tasks):
                 qs_chunk = list(itertools.islice(qs_it, len(count_task_chunk["items"])))
-                future = pool.submit(create_tasks_from_counts, client, qs_chunk, count_task_chunk)
+                future = pool.submit(dps_orchestrator.create_tasks_from_counts, qs_chunk, count_task_chunk)
                 futures_dct[future] = DpsTaskType.CREATE_TASKS
 
         for future in as_completed(futures_dct):
@@ -641,7 +528,10 @@ if __name__ == "__main__":
         {"limit": None, "external_id": "9624122_cargo_type"},  # string
         {"limit": None, "external_id": "ts-test-#01-daily-651/650"},  # missing
     ]
+    from local_cog_client import setup_local_cog_client
+    client = setup_local_cog_client()
     query = NewDatapointsQuery(
+        client=client.datapoints,
         start=START,
         end=END,
         id=ID,
@@ -654,6 +544,4 @@ if __name__ == "__main__":
     )
     q = query.all_validated_queries
     pprint(q)
-    from local_cog_client import setup_local_cog_client
-    client = setup_local_cog_client()
     count_based_task_splitting(q, client, max_workers=1)
