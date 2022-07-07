@@ -1,10 +1,10 @@
 from __future__ import annotations
-# from abc import ABC
+from abc import abstractmethod
 from pprint import pprint, pformat  # noqa
 import math
 import numbers
 import operator as op
-from typing import List, Union, Optional, Dict, NoReturn, Tuple
+from typing import List, Union, Optional, Dict, NoReturn, Tuple, Callable
 from functools import cached_property
 from datetime import datetime
 import enum
@@ -21,14 +21,12 @@ from cognite.client._api.datapoints_extra import (
     single_datapoints_api_call,
     build_count_query_payload,
     handle_missing_ts,
-    handle_string_ts,
-    get_is_string_property,
     remove_string_ts,
 )
 from cognite.client._api.datapoints import DatapointsAPI
-from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms, granularity_unit_to_ms
+from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms
 from cognite.client.data_classes import DatapointsQuery
-from cognite.client.exceptions import CogniteAPIError, CogniteNotFoundError
+from cognite.client.exceptions import CogniteAPIError
 from cognite.client.utils._auxiliary import to_camel_case
 
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
@@ -290,14 +288,14 @@ class TSQuery:
         elif aggregates is None:
             if granularity is None:
                 return cls(**dct)  # Request for raw datapoints
-            raise ValueError(f"When passing `granularity`, argument `aggregates` is also required.")
+            raise ValueError("When passing `granularity`, argument `aggregates` is also required.")
 
         # Aggregates must be a list at this point:
         elif len(aggregates) == 0:
             raise ValueError("Empty list of `aggregates` passed, expected at least one!")
 
         elif granularity is None:
-            raise ValueError(f"When passing `aggregates`, argument `granularity` is also required.")
+            raise ValueError("When passing `aggregates`, argument `granularity` is also required.")
 
         elif dct["include_outside_points"] is True:
             raise ValueError("'Include outside points' is not supported for aggregates.")
@@ -318,50 +316,87 @@ class DpsTaskType(enum.Enum):
     DATAPOINTS = enum.auto()
 
 
+def dps_fetch_strategy_selector(query: TSQuery, parallel: bool) -> BaseDpsTask:
+    selector = (
+        query.is_raw_query,
+        parallel,
+        bool(query.is_string),  # Status is typically unknown, except where checked to be True
+    )
+    return {
+        # raw parall string
+        (True, True, True): RawParallelDpsTask,
+        (True, True, False): RawParallelDpsTask,
+        (True, False, True): RawSerialDpsTask,
+        (True, False, False): RawSerialDpsTask,
+        # (None, None, None, None): None,
+    }[selector]
+
+
 @dataclass
 class BaseDpsTask:
-    # TODO: If python allows defining abstract dataclasses (easily) at some point, change this class:
-    #       https://github.com/python/mypy/issues/5374  (workaround too ugly lol)
     query: TSQuery
     client: DatapointsAPI
+    is_done: bool = dataclasses.field(default=False, init=False)
+    n_dps_fetched: int = dataclasses.field(default=0, init=False)
+    dps_lsts: List[List[Union[Tuple, List[Tuple]]]] = dataclasses.field(default_factory=list, init=False)
+
+    # TODO: If python allows defining abstract dataclasses (easily) at some point, change this class:
+    #       https://github.com/python/mypy/issues/5374  (workaround too ugly lol)
+    @abstractmethod
+    def get_result(self, finalize):
+        ...
 
 
-@dataclass
+class RawDpsTask(BaseDpsTask):
+    offset_next: int = dataclasses.field(default=1, init=False)
+    unpack_fn: Callable[[str, str], Tuple[int, Union[str, float]]] = dataclasses.field(
+        default=op.itemgetter("timestamp", "value"), init=False  # NB: timestamp must be first
+    )
+
+
 class SerialDpsTask(BaseDpsTask):
-    """A datapoints fetching task that executes in serial"""
+    def get_result(self, finalize=True):
+        if self.is_done:
+            res = itertools.chain.from_iterable(self.dps_lsts)
+            return list(res) if finalize else res
+        raise RuntimeError("Datapoints task asked for final result before fetching was done")
+
+
+class ParallelDpsTask(BaseDpsTask):
+    def get_result(self, finalize=True):
+        if self.is_done:
+            res = itertools.chain.from_iterable(dps.get_result(finalize=False) for dps in self.dps_lsts)
+            return list(res) if finalize else res
+        raise RuntimeError("Datapoints task asked for final result before fetching was done")
+
+
+class RawSerialDpsTask(SerialDpsTask, RawDpsTask):
+    """A raw datapoints fetching task for numeric and string data that executes in serial"""
 
     def __post_init__(self):
-        self.is_done = False
-        self.n_dps_fetched = 0
         self.is_first_query = True
+        self.n_dps_left = self.query.limit
         self.next_start = self.query.start
-        self.dps_lsts: List[List[Tuple[Union[float, str], ...]]] = []
-        if self.query.is_raw_query:
-            self.offset_next = 1
-            self.unpack_fn = op.itemgetter("timestamp", "value")  # NB: timestamp must be first
-        else:
-            self.offset_next = granularity_to_ms(self.query.granularity)
-            self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
 
-    def _create_payload_item(self, limit):
+    def _create_payload_item(self):
         return {
             **self.query.identifier_dct,
             "start": self.next_start,
             "end": self.query.end,
-            "aggregates": self.query.aggregates,
-            "granularity": self.query.granularity,
             "includeOutsidePoints": self.query.include_outside_points,
-            "limit": limit,
+            "limit": min(self.n_dps_left, self.query._DPS_LIMIT),
          }
 
     def get_next_task(self):
         if self.is_done:
             return None
-        # if
-        limit = None
-        return self._create_payload_item(limit)
+        return self._create_payload_item()
 
     def store_partial_result(self, res):
+        if not res:
+            self.is_done = True
+            return
+
         first_idx = 0
         if self.query.include_outside_points and not self.is_first_query:
             # For all queries -not the first-, we might need to chop off the first dp.
@@ -372,12 +407,12 @@ class SerialDpsTask(BaseDpsTask):
         self.is_first_query = False
 
         last_idx = None
-        # TODO(haakonvt): Is this better moved to `get_next_task`?
-        if self.query.limit is not None:
-            n_dps_left = self.query.limit - self.n_dps_fetched
-            if n_dps_left < len(res) - first_idx:
-                last_idx = n_dps_left + first_idx
+        self.n_dps_left = min(0, self.n_dps_left - len(res) + first_idx)
+        if not self.n_dps_left:
+            self.is_done = True
+            return
 
+        last_idx = self.n_dps_left + first_idx
         if first_idx or last_idx:
             # List slices copies the ref. array; minor speedup using islice:
             res = itertools.islice(res, first_idx, last_idx)
@@ -386,17 +421,13 @@ class SerialDpsTask(BaseDpsTask):
         self.next_start = res[-1][0] + self.offset_next
         self.n_dps_fetched += len(res)
 
-        self.is_done = ???? # TODO(haakonvt): ARE WE DONE?
+        self.is_done = ...  # TODO(haakonvt): ARE WE DONE?
 
 
-@dataclass
-class ParallelLimitedDpsTask(BaseDpsTask):
-    """A limited-fetch-datapoints task that executes in parallel. Tries to quit early"""
-
-
-@dataclass
-class ParallelUnlimitedDpsTask(BaseDpsTask):
-    """A fetch-all datapoints task that executes in parallel"""
+class RawParallelDpsTask(ParallelDpsTask):
+    """A raw datapoints fetching task for numeric and string data that executes in parallel"""
+    # self.offset_next = granularity_to_ms(self.query.granularity)
+    # self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
 
 
 class DpsFetchOrchestrator:
@@ -497,7 +528,6 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
         #             new_futures_dct[future] = new_task.task_type
         #         # Swap
         #         futures_dct = new_futures_dct
-
 
 
 if __name__ == "__main__":
