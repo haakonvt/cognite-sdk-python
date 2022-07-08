@@ -1,22 +1,11 @@
 from __future__ import annotations
-from abc import ABC
-from pprint import pprint, pformat
 import math
-import numbers
-from typing import List, Union, Optional, Dict, NoReturn
-from functools import partial, cached_property
-from datetime import datetime
-import enum
-import dataclasses
-import itertools
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 # from timeit import default_timer as timer
 
-from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms, granularity_unit_to_ms
-from cognite.client.data_classes import DatapointsQuery
-from cognite.client.exceptions import CogniteAPIError, CogniteNotFoundError
-from cognite.client.utils._auxiliary import to_camel_case
+from cognite.client.utils._time import granularity_to_ms, granularity_unit_to_ms
+from cognite.client.exceptions import CogniteNotFoundError
 
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
 
@@ -82,10 +71,15 @@ def find_count_granularity_for_query(
 def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
     chunk, n_items, n_dps = [], 0, 0
     for item in payload.pop("items"):
-        # If limit not given per item, we require default to exist (if not, raise KeyError):
-        dps_limit = item.get("limit", payload["limit"])
-        if dps_limit is None:  # Need explicit None-check because falsy 0 is an allowed limit
-             dps_limit = max_dps
+        try:
+            dps_limit = item["limit"]
+        except KeyError:
+            # If limit not given per item, we require default to exist:
+            dps_limit = payload["limit"]
+
+        if dps_limit is None:  # Note: 0 (falsy) is an allowed limit
+            dps_limit = max_dps
+
         if n_items + 1 > max_items or n_dps + dps_limit > max_dps:
             yield {**payload, "items": chunk}
             chunk, n_items, n_dps = [], 0, 0
@@ -97,9 +91,7 @@ def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
 
 
 def single_datapoints_api_call(client, payload):
-    return (
-        client.datapoints._post(client.datapoints._RESOURCE_PATH + "/list", json=payload).json()
-    )["items"]
+    return client.datapoints._post(client.datapoints._RESOURCE_PATH + "/list", json=payload).json()["items"]
 
 
 def build_count_query_payload(queries):
@@ -142,7 +134,8 @@ def get_is_string_property(client, queries):
     # We do not know if duplicates exist between those given by `id` and `external_id`.
     # Quick fix is to send two separate queries ಠಿ_ಠ
     futures = []
-    # TODO(haakonvt): Dont really want another TPE inside here:
+    # TODO(haakonvt): Dont really want another TPE inside here????:
+    # TODO(haakonvt): Chunk if number of time series is too large! (and change max_workers?)
     with ThreadPoolExecutor(max_workers=2) as pool:
         for identifier_type in ["id", "externalId"]:
             items = set(q.identifier for q in queries if q.identifier_type == identifier_type)
@@ -172,6 +165,7 @@ def remove_string_ts(client, queries, items):
         # TODO: Can time series have external_id=None? Might need ic.get("xid", NOT_NONE)
         if ("id", ic.get("id")) in keep or ("externalId", ic.get("externalId")) in keep
     ]
+    # TODO(haakonvt): Change O(2N) to O(N):
     string_qs = [q for q in queries if q.is_string]
     queries = [q for q in queries if not q.is_string]
     return keep_items, queries, string_qs

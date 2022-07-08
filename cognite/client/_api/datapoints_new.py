@@ -1,8 +1,10 @@
 from __future__ import annotations
 from abc import abstractmethod
 from pprint import pprint, pformat  # noqa
+import threading
 import math
 import numbers
+import heapq
 import operator as op
 from typing import List, Union, Optional, Dict, NoReturn, Tuple, Callable
 from functools import cached_property
@@ -14,6 +16,7 @@ from dataclasses import dataclass, InitVar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 # from timeit import default_timer as timer
 
+from cognite.client._api.datapoints import DatapointsAPI
 from cognite.client._api.datapoints_extra import (
     align_window_start_and_end,
     find_count_granularity_for_query,
@@ -23,7 +26,6 @@ from cognite.client._api.datapoints_extra import (
     handle_missing_ts,
     remove_string_ts,
 )
-from cognite.client._api.datapoints import DatapointsAPI
 from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms
 from cognite.client.data_classes import DatapointsQuery
 from cognite.client.exceptions import CogniteAPIError
@@ -33,6 +35,7 @@ print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
 
 TIME_UNIT_IN_MS = {"s": 1000, "m": 60000, "h": 3600000, "d": 86400000}
+LOCK = threading.Lock()
 
 # Notes list
 # - Union[int, float] is the same as `float`.
@@ -179,10 +182,9 @@ class TSQuery:
     aggregates: Optional[List[str]] = None
     ignore_unknown_ids: Optional[bool] = None
 
-    def __post_init__(self):
-        self._DPS_LIMIT_AGG = self.client._DPS_LIMIT_AGG
-        self._DPS_LIMIT = self.client._DPS_LIMIT
-        del self.client
+    def __post_init__(self, client):
+        self._DPS_LIMIT_AGG = client._DPS_LIMIT_AGG
+        self._DPS_LIMIT = client._DPS_LIMIT
         self._is_missing = None  # I.e. not set...
         self._is_string = None  # ...or unknown
         self._verify_time_range()
@@ -276,7 +278,7 @@ class TSQuery:
     @classmethod
     def from_dict_with_validation(cls, ts_dct, client, defaults) -> TSQuery:
         # We merge 'defaults' and given ts-dict, ts-dict takes precedence:
-        dct = {**defaults, **ts_dct}
+        dct = {**defaults, **ts_dct, "client": client}
         granularity, aggregates = dct["granularity"], dct["aggregates"]
 
         if not (granularity is None or isinstance(granularity, str)):
@@ -324,14 +326,17 @@ def dps_fetch_strategy_selector(query: TSQuery, parallel: bool) -> BaseDpsTask:
     )
     return {
         # raw parall string
-        (True, True, True): RawParallelDpsTask,
-        (True, True, False): RawParallelDpsTask,
+        # (True, True, True): RawParallelDpsTask,
+        # (True, True, False): RawParallelDpsTask,
         (True, False, True): RawSerialDpsTask,
         (True, False, False): RawSerialDpsTask,
         # (None, None, None, None): None,
     }[selector]
 
 
+# TODO: Normal (or abstract) class instead maybe? If python allows defining abstract dataclasses (easily)
+#       at some point, change this class:
+#       https://github.com/python/mypy/issues/5374
 @dataclass
 class BaseDpsTask:
     query: TSQuery
@@ -340,8 +345,6 @@ class BaseDpsTask:
     n_dps_fetched: int = dataclasses.field(default=0, init=False)
     dps_lsts: List[List[Union[Tuple, List[Tuple]]]] = dataclasses.field(default_factory=list, init=False)
 
-    # TODO: If python allows defining abstract dataclasses (easily) at some point, change this class:
-    #       https://github.com/python/mypy/issues/5374  (workaround too ugly lol)
     @abstractmethod
     def get_result(self, finalize):
         ...
@@ -365,7 +368,9 @@ class SerialDpsTask(BaseDpsTask):
 class ParallelDpsTask(BaseDpsTask):
     def get_result(self, finalize=True):
         if self.is_done:
-            res = itertools.chain.from_iterable(dps.get_result(finalize=False) for dps in self.dps_lsts)
+            res = itertools.chain.from_iterable(
+                dps_task.get_result(finalize=False) for dps_task in self.dps_lsts
+            )
             return list(res) if finalize else res
         raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
@@ -407,40 +412,45 @@ class RawSerialDpsTask(SerialDpsTask, RawDpsTask):
         self.is_first_query = False
 
         last_idx = None
-        self.n_dps_left = min(0, self.n_dps_left - len(res) + first_idx)
-        if not self.n_dps_left:
-            self.is_done = True
-            return
+        n_new_dps = len(res) - first_idx
+        if self.n_dps_left < n_new_dps:
+            last_idx = self.n_dps_left + first_idx
 
-        last_idx = self.n_dps_left + first_idx
         if first_idx or last_idx:
-            # List slices copies the ref. array; minor speedup using islice:
+            # List slices copies the underlying ref. array; minor speedup using islice:
             res = itertools.islice(res, first_idx, last_idx)
         res = list(map(self.unpack_fn, res))
         self.dps_lsts.append(res)
+
         self.next_start = res[-1][0] + self.offset_next
         self.n_dps_fetched += len(res)
-
-        self.is_done = ...  # TODO(haakonvt): ARE WE DONE?
+        self.n_dps_left = min(0, self.n_dps_left - n_new_dps)
+        if not self.n_dps_left:
+            self.is_done = True
 
 
 class RawParallelDpsTask(ParallelDpsTask):
     """A raw datapoints fetching task for numeric and string data that executes in parallel"""
-    # self.offset_next = granularity_to_ms(self.query.granularity)
-    # self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
+
+    def foo(self):  # TODO(haakonvt): ...
+        self.offset_next = granularity_to_ms(self.query.granularity)
+        self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
 
 
 class DpsFetchOrchestrator:
     def __init__(self, client):
         self.client = client
-
-    # "ignoreUnknownIds": False,  # If a ts is deleted while fetching, we want error instead of a part result
+        # API queries can return up to max limit of aggregates AND max limit of raw dps independently
+        self.raw_pri_queue = []
+        self.agg_pri_queue = []
+        self._next_api_payload = {"items": []}
+        self._task_counter = itertools.count()  # Unique task counter and id
+        self._task_lookup = {}  # Find tasks to mark e.g. "skip" if a limited query is finished early
 
     @staticmethod
     def generate_string_ts_tasks(queries):
-        print("- NOT IMPLEMENTED: `generate_string_ts_tasks`")
-        tasks = []
-        return tasks
+        print("- WARNING: all string TS will be fetched in series (part 1, then part 2...)")
+        return [dps_fetch_strategy_selector(q, parallel=False) for q in queries]
 
     @staticmethod
     def generate_ts_tasks(queries, res):
@@ -451,7 +461,7 @@ class DpsFetchOrchestrator:
             approx_tot = sum(dp["count"] for dp in counts)
             if approx_tot < q.max_query_limit:
                 # We are expecting a full fetch in a single request
-                tasks.append((SerialDpsTask(q), DpsTaskType.DATAPOINTS))
+                tasks.append(dps_fetch_strategy_selector(q, parallel=False))
         return tasks
 
     def get_available_counts(self, queries, count_query):
@@ -480,13 +490,80 @@ class DpsFetchOrchestrator:
             tasks.extend(self.generate_string_ts_tasks(string_qs))
         if queries:
             tasks.extend(self.generate_ts_tasks(queries, counts_dps))
-        print(f"{tasks = }")
-        input("...")
+
+        tasks = list(itertools.zip_longest(tasks, [], fillvalue=DpsTaskType.DATAPOINTS))
+        print("##################")
+        print(f"create_tasks_from_counts:\n{tasks = }")
         return tasks
 
-    # def handle_and_create_tasks_from_new_dps(queries, new_dps):
-    #     for q, dps in zip(queries, new_dps):
-    #         self.data_dct[q].store_partial_result(dps)
+    def queue_new_tasks(self, tasks):
+        for priority, task in tasks:
+            queue = (self.raw_pri_queue, self.agg_pri_queue)[task.get("aggregates") is None]
+            n = next(self._task_counter)
+            # We leverage how tuples are compared to prioritise items. First `priority`, then `limit`
+            # (to easily group smaller queries), then `counter` to always break ties (never use tasks themselves):
+            heapq.heappush(queue, (priority, task["limit"], n, task))
+            self._task_lookup[n] = task
+
+    def combine_tasks_into_new_queries(self, return_last_query: bool = False):
+        """Returns the payload to get datapoints"""
+        if not self.raw_pri_queue and not self.agg_pri_queue:
+            if return_last_query:
+                query, self._next_api_payload = self._next_api_payload, {"items": []}
+                return [query]
+            return []
+
+        queries = []
+        queues = (self.raw_pri_queue, self.agg_pri_queue)
+        max_dps_limits = (self.client.datapoints._DPS_LIMIT, self.client.datapoints._DPS_LIMIT_AGG)
+        while any(queues):  # As long as not both are empty
+            for pri_q, is_raw, max_dps in zip(queues, [True, False], max_dps_limits):
+                if not pri_q:
+                    continue
+                cur_lim, cur_n_items, cur_items = 0, 0, self._next_api_payload["items"]
+                if cur_items:
+                    # Tally up either raw or agg query limits:
+                    existing_qs = [d["limit"] for d in cur_items if (d.get("aggregates") is None) is is_raw]
+                    cur_n_items, cur_lim = len(existing_qs), sum(existing_qs)
+                while pri_q:
+                    _, limit, _, next_task = pri_q[0]  # Highest pri task is always at index 0 (heap magic)
+                    will_fit_next_limit = max_dps >= cur_lim + limit
+                    will_fit_next_n_items = 100 >= cur_n_items + 1
+                    if will_fit_next:
+                        cur_items.append(next_task)
+
+                    if payload_at_max:
+                        queries.append({"items": self._next_api_payload})
+                        self._next_api_payload = {}
+        return queries
+
+
+def combine_tasks_into_max_sized_queries(payload, max_items=100, max_dps=10_000):
+    chunk, n_items, n_dps = [], 0, 0
+    for item in payload.pop("items"):
+        try:
+            dps_limit = item["limit"]
+        except KeyError:
+            # If limit not given per item, we require default to exist:
+            dps_limit = payload["limit"]
+
+        if dps_limit is None:  # Note: 0 (falsy) is an allowed limit
+            dps_limit = max_dps
+
+        if n_items + 1 > max_items or n_dps + dps_limit > max_dps:
+            yield {**payload, "items": chunk}
+            chunk, n_items, n_dps = [], 0, 0
+        chunk.append(item)
+        n_items += 1
+        n_dps += dps_limit
+    if chunk:
+        yield {**payload, "items": chunk}
+
+
+
+
+
+
 
 
 def count_based_task_splitting(query_lst, client, max_workers=10):
@@ -499,79 +576,27 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
                 continue
             qs_it = iter(queries)
             count_tasks = build_count_query_payload(queries)
-            # Smash together as many of the count-aggregate requets as possible:
+            # Smash together as many of the count-aggregate requests as possible:
             for count_task_chunk in chunk_queries_to_allowed_limits(count_tasks):
                 qs_chunk = list(itertools.islice(qs_it, len(count_task_chunk["items"])))
                 future = pool.submit(dps_orchestrator.create_tasks_from_counts, qs_chunk, count_task_chunk)
                 futures_dct[future] = DpsTaskType.CREATE_TASKS
 
-        for future in as_completed(futures_dct):
-            print("Calling .result() in 1")
-            print(f"{future.result() = }")
-        raise SystemExit(0)
+        while futures_dct:
+            # Queue up new work as soon as possible by using `as_completed`:
+            future = next(as_completed(futures_dct))
+            res, task_type = future.result(), futures_dct[future]
+            print("##################")
+            print(f"{task_type=}")
 
-        # while futures_dct:
-        #     new_futures_dct = {}
-        #     # Queue up new work as soon as possible by using `as_completed`:
-        #     for future in as_completed(futures_dct):
-        #         res = future.result()
-        #         task_type = futures_dct[future]
-        #         if task_type is DpsTaskType.CREATE_TASKS:
-        #             new_tasks = res
-        #         elif task_type is DpsTaskType.DATAPOINTS:
-        #             new_tasks = dps_orchestrator.handle_and_create_tasks_from_new_dps(res)
-        #         else:
-        #             raise ValueError(f"Task type not understood, expected {DpsTaskType}, not {task_type}")
-        #
-        #         for new_task in new_tasks:
-        #             future = pool.submit(*new_task)
-        #             new_futures_dct[future] = new_task.task_type
-        #         # Swap
-        #         futures_dct = new_futures_dct
+            if task_type is DpsTaskType.CREATE_TASKS:
+                dps_orchestrator.queue_new_tasks(res)
+                new_queries = dps_orchestrator.combine_tasks_into_new_queries()
 
+            elif task_type is DpsTaskType.DATAPOINTS:
+                dps_orchestrator.handle_fetched_new_dps(res)
+            else:
+                raise ValueError(f"Task type not understood, expected {DpsTaskType}, not {type(task_type)}")
 
-if __name__ == "__main__":
-    # Specify the aggregates to return. Use default if null.
-    # If the default is a set of aggregates,
-    # specify an empty string to get raw data.
-    START = None
-    END = None
-    AGGREGATES = None  # ["average"]
-    GRANULARITY = None  # "12h"
-    INCLUDE_OUTSIDE_POINTS = None
-    LIMIT = None
-    IGNORE_UNKNOWN_IDS = True
-    # IGNORE_UNKNOWN_IDS = False
-    ID = None
-    ID = [
-        {"id": 226740051491},
-        {"id": 2546012653669},  # string
-        {"id": 1111111111111},  # prob missing...
-        # {"id": 2546012653669, "aggregates": ["max", "average"], "granularity": "1d"},  # string
-    ]
-    EXTERNAL_ID = [
-        {"limit": None, "external_id": "ts-test-#01-daily-111/650"},
-        {"limit": None, "external_id": "ts-test-#01-daily-222/650"},
-        {"limit": None, "external_id": "ts-test-#01-daily-64/650"},
-        {"limit": None, "external_id": "ts-test-#01-daily-444/650"},
-        {"limit": None, "external_id": "8400074_destination"},  # string
-        {"limit": None, "external_id": "9624122_cargo_type"},  # string
-        {"limit": None, "external_id": "ts-test-#01-daily-651/650"},  # missing
-    ]
-    from local_cog_client import setup_local_cog_client
-    client = setup_local_cog_client()
-    query = NewDatapointsQuery(
-        client=client.datapoints,
-        start=START,
-        end=END,
-        id=ID,
-        external_id=EXTERNAL_ID,
-        aggregates=AGGREGATES,
-        granularity=GRANULARITY,
-        include_outside_points=INCLUDE_OUTSIDE_POINTS,
-        limit=LIMIT,
-        ignore_unknown_ids=IGNORE_UNKNOWN_IDS,
-    )
-    q = query.all_validated_queries
-    pprint(q)
-    count_based_task_splitting(q, client, max_workers=1)
+            for q in new_queries:
+                futures_dct[pool.submit(*q)] = DpsTaskType.DATAPOINTS
