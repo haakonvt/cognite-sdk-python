@@ -21,6 +21,7 @@ from cognite.client._api.datapoints_extra import (
     align_window_start_and_end,
     find_count_granularity_for_query,
     chunk_queries_to_allowed_limits,
+    task_is_raw,
     single_datapoints_api_call,
     build_count_query_payload,
     handle_missing_ts,
@@ -35,7 +36,7 @@ print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
 
 TIME_UNIT_IN_MS = {"s": 1000, "m": 60000, "h": 3600000, "d": 86400000}
-LOCK = threading.Lock()
+THREAD_LOCK = threading.Lock()
 
 # Notes list
 # - Union[int, float] is the same as `float`.
@@ -440,7 +441,9 @@ class RawParallelDpsTask(ParallelDpsTask):
 class DpsFetchOrchestrator:
     def __init__(self, client):
         self.client = client
-        # API queries can return up to max limit of aggregates AND max limit of raw dps independently
+        self._DPS_LIMIT_AGG = client.datapoints._DPS_LIMIT_AGG
+        self._DPS_LIMIT = client.datapoints._DPS_LIMIT
+        # API queries can return up to max limit of aggregates AND max limit of raw dps independently:
         self.raw_pri_queue = []
         self.agg_pri_queue = []
         self._next_api_payload = {"items": []}
@@ -449,7 +452,7 @@ class DpsFetchOrchestrator:
 
     @staticmethod
     def generate_string_ts_tasks(queries):
-        print("- WARNING: all string TS will be fetched in series (part 1, then part 2...)")
+        print("- WARNING (simple implementation): all string TS will be fetched in serially...")
         return [dps_fetch_strategy_selector(q, parallel=False) for q in queries]
 
     @staticmethod
@@ -498,43 +501,59 @@ class DpsFetchOrchestrator:
 
     def queue_new_tasks(self, tasks):
         for priority, task in tasks:
-            queue = (self.raw_pri_queue, self.agg_pri_queue)[task.get("aggregates") is None]
+            queue = (self.raw_pri_queue, self.agg_pri_queue)[task_is_raw(task)]
             n = next(self._task_counter)
             # We leverage how tuples are compared to prioritise items. First `priority`, then `limit`
             # (to easily group smaller queries), then `counter` to always break ties (never use tasks themselves):
             heapq.heappush(queue, (priority, task["limit"], n, task))
             self._task_lookup[n] = task
 
-    def combine_tasks_into_new_queries(self, return_last_query: bool = False):
+    def combine_tasks_into_new_queries(self, return_partial_query: bool = False):
         """Returns the payload to get datapoints"""
-        if not self.raw_pri_queue and not self.agg_pri_queue:
-            if return_last_query:
+        queues = (self.agg_pri_queue, self.raw_pri_queue)
+        if not any(queues):
+            cur_items = self._next_api_payload["items"]
+            if return_partial_query and cur_items:
                 query, self._next_api_payload = self._next_api_payload, {"items": []}
                 return [query]
             return []
 
         queries = []
-        queues = (self.raw_pri_queue, self.agg_pri_queue)
-        max_dps_limits = (self.client.datapoints._DPS_LIMIT, self.client.datapoints._DPS_LIMIT_AGG)
-        while any(queues):  # As long as not both are empty
-            for pri_q, is_raw, max_dps in zip(queues, [True, False], max_dps_limits):
-                if not pri_q:
+        max_dps_limits = (self._DPS_LIMIT_AGG, self._DPS_LIMIT)
+        while any(queues):  # As long as both not are empty
+            payload_at_max_items, payload_is_full = False, [False, False]
+            for queue, max_dps, is_raw in zip(queues, max_dps_limits, [False, True]):
+                if not queue:
                     continue
-                cur_lim, cur_n_items, cur_items = 0, 0, self._next_api_payload["items"]
+                cur_lim, cur_items = 0, self._next_api_payload["items"]
                 if cur_items:
                     # Tally up either raw or agg query limits:
-                    existing_qs = [d["limit"] for d in cur_items if (d.get("aggregates") is None) is is_raw]
-                    cur_n_items, cur_lim = len(existing_qs), sum(existing_qs)
-                while pri_q:
-                    _, limit, _, next_task = pri_q[0]  # Highest pri task is always at index 0 (heap magic)
-                    will_fit_next_limit = max_dps >= cur_lim + limit
-                    will_fit_next_n_items = 100 >= cur_n_items + 1
-                    if will_fit_next:
+                    cur_lim = sum(d["limit"] for d in cur_items if task_is_raw(d) is is_raw)
+                while queue:
+                    if len(cur_items) + 1 > 100:
+                        payload_at_max_items = True
+                        break
+                    _, limit, _, next_task = queue[0]  # Highest pri task is always at index 0 (heap magic)
+                    if cur_lim + limit <= max_dps:
                         cur_items.append(next_task)
+                        cur_lim += limit
+                        heapq.heappop(queue)  # Pop to remove from heap
+                    else:
+                        payload_is_full[is_raw] = True
+                        break
 
-                    if payload_at_max:
-                        queries.append({"items": self._next_api_payload})
-                        self._next_api_payload = {}
+                payload_done = (
+                    payload_at_max_items
+                    or all(payload_is_full)
+                    or (payload_is_full[1] and not self.agg_pri_queue)
+                    or (payload_is_full[0] and not self.raw_pri_queue)
+                    or (return_partial_query and not any(queues))
+                )
+                if payload_done:
+                    queries.append(cur_items)
+                    self._next_api_payload["items"] = []
+                    break
+
         return queries
 
 
@@ -569,7 +588,8 @@ def combine_tasks_into_max_sized_queries(payload, max_items=100, max_dps=10_000)
 def count_based_task_splitting(query_lst, client, max_workers=10):
     dps_orchestrator = DpsFetchOrchestrator(client)
     # Set up pool using `max_workers` using at least 1 thread:
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+    assert max_workers > 0, f"Number of parallel workers threads must be at least one, not {max_workers=}"
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures_dct = {}
         for queries in (query_lst.raw_queries, query_lst.aggregate_queries):
             if not queries:
@@ -584,19 +604,25 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
 
         while futures_dct:
             # Queue up new work as soon as possible by using `as_completed`:
+            # TODO: Is this better than `wait(..., return_when=FIRST_COMPLETED)`?
             future = next(as_completed(futures_dct))
-            res, task_type = future.result(), futures_dct[future]
-            print("##################")
-            print(f"{task_type=}")
+            res, task_type = future.result(), futures_dct.pop(future)
 
-            if task_type is DpsTaskType.CREATE_TASKS:
-                dps_orchestrator.queue_new_tasks(res)
-                new_queries = dps_orchestrator.combine_tasks_into_new_queries()
-
-            elif task_type is DpsTaskType.DATAPOINTS:
+            if task_type is DpsTaskType.DATAPOINTS:
                 dps_orchestrator.handle_fetched_new_dps(res)
+                dps_orchestrator.queue_new_tasks(res)
+            elif task_type is DpsTaskType.CREATE_TASKS:
+                dps_orchestrator.queue_new_tasks(res)
             else:
                 raise ValueError(f"Task type not understood, expected {DpsTaskType}, not {type(task_type)}")
 
-            for q in new_queries:
-                futures_dct[pool.submit(*q)] = DpsTaskType.DATAPOINTS
+            # Idk if lock needed, create tasks is very imporant
+            with THREAD_LOCK:
+                # TODO: Play with these settings:
+                qsize = pool._work_queue.qsize()  # From docs: approximate size of the queue
+                if qsize < 1.5 * max_workers + 1:
+                    new_queries = dps_orchestrator.combine_tasks_into_new_queries()
+
+                    for payload in new_queries:
+                        future = pool.submit(single_datapoints_api_call, client, payload)
+                        futures_dct[future] = DpsTaskType.DATAPOINTS

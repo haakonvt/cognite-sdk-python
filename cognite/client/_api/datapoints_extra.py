@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from typing import Optional
+from typing import Optional, Dict
 from concurrent.futures import ThreadPoolExecutor
 # from timeit import default_timer as timer
 
@@ -92,6 +92,10 @@ def chunk_queries_to_allowed_limits(payload, max_items=100, max_dps=10_000):
 
 def single_datapoints_api_call(client, payload):
     return client.datapoints._post(client.datapoints._RESOURCE_PATH + "/list", json=payload).json()["items"]
+
+
+def task_is_raw(task: Dict) -> bool:
+    return task.get("aggregates") is None
 
 
 def build_count_query_payload(queries):
