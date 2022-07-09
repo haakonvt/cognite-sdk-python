@@ -273,7 +273,7 @@ class TSQuery:
     @property
     def max_query_limit(self):
         if self.is_raw_query:
-            self._DPS_LIMIT  # 100k
+            return self._DPS_LIMIT  # 100k
         return self._DPS_LIMIT_AGG  # 10k
 
     @classmethod
@@ -389,6 +389,9 @@ class RawSerialDpsTask(RawDpsTask, SerialDpsTask):
         self.next_start = self.query.start
         self.priority = 0  # TODO(haakonvt): Should be accepted as input arg
 
+    def __hash__(self):
+        return id(self)  # We just need uniqueness
+
     def _create_payload_item(self):
         return {
             **self.query.identifier_dct,
@@ -452,13 +455,18 @@ class DpsFetchOrchestrator:
         self.raw_pri_queue = []  # TODO: Consider queue.PriorityQueue
         self.agg_pri_queue = []  # TODO: Consider queue.PriorityQueue
         self.queues = (self.agg_pri_queue, self.raw_pri_queue)
+        # self.tasks_running = set()
+        # self.tasks_done = set()
+        # Queries with duplicated identifiers are allowed so we need to know exactly which fetched datapoints
+        # belong to which tasks:
+        self._next_tasks = []
         self._next_api_payload = {"items": []}
         self._task_counter = itertools.count()  # Unique task counter and id
         self._task_lookup = {}  # Find tasks to mark e.g. "skip" if a limited query is finished early
 
     @staticmethod
     def generate_string_ts_tasks(queries, client):
-        print("- WARNING (simple implementation): all string TS will be fetched in serially...")  # TODO(haakonvt)
+        print("- WARNING (simple implementation): all string TS will be fetched serially...")  # TODO(haakonvt)
         return [
             dps_fetch_strategy_selector(q, parallel=False)(q, client) for q in queries
         ]
@@ -470,7 +478,7 @@ class DpsFetchOrchestrator:
             assert r[q.identifier_type] == q.identifier, "Counts belong to wrong time series."
             counts = r["datapoints"]
             approx_tot = sum(dp["count"] for dp in counts)
-            if approx_tot < q.max_query_limit:
+            if q.limit < q.max_query_limit or approx_tot < q.max_query_limit:
                 # We are expecting a full fetch in a single request
                 tasks.append(dps_fetch_strategy_selector(q, parallel=False)(q, client))
             else:
@@ -505,30 +513,40 @@ class DpsFetchOrchestrator:
             tasks.extend(self.generate_ts_tasks(queries, counts_dps, self.client))
         return tasks
 
-    def handle_fetched_new_dps(self, res):
+    def handle_fetched_new_dps(self, tasks, res):
         print("Function `handle_fetched_new_dps` got res:")
+        for task, r in zip(tasks, res):
+            assert r[task.query.identifier_type] == task.query.identifier, "Dps fetch failed"
+            task.store_partial_result(r["datapoints"])
+            print(f"{task.is_done=}")
+            print(f"{task.get_result()=}")
+        input("enter to print datapoints")
         pprint(res)
+        input("...")
         return []
 
-    def queue_new_tasks(self, tasks):
-        for task in tasks:
+    def queue_new_tasks(self, new_tasks):
+        for task in new_tasks:
             priority, payload = task.get_next_task()
             if payload is None:
-                print(f"Function `queue_new_tasks` got a None task: {payload}. Skipping!")
+                print(f"- Function `queue_new_tasks` got a None task: {payload}. Skipping!")
+                # self.tasks_done.add(self.tasks_running.remove(task))
                 continue
+            # self.tasks_running.add(task)
             queue = self.queues[task_is_raw(payload)]
             n = next(self._task_counter)
             # We leverage how tuples are compared to prioritise items. First `priority`, then `limit`
             # (to easily group smaller queries), then `counter` to always break ties (never use tasks themselves):
-            heapq.heappush(queue, (priority, payload["limit"], n, payload))
+            heapq.heappush(queue, (priority, payload["limit"], n, task, payload))
             self._task_lookup[n] = payload
 
     def combine_tasks_into_new_queries(self, return_partial_query: bool = False):
         if not any(self.queues):
-            cur_items = self._next_api_payload["items"]
+            cur_tasks, cur_items = self._next_tasks, self._next_api_payload["items"]
             if return_partial_query and cur_items:
-                query, self._next_api_payload = self._next_api_payload, {"items": []}
-                return [query]
+                task, query = self._next_tasks, self._next_api_payload
+                self._next_tasks, self._next_api_payload = [], {"items": []}
+                return [(task, query)]
             return []
 
         queries = []
@@ -538,7 +556,7 @@ class DpsFetchOrchestrator:
             for queue, max_dps, is_raw in zip(self.queues, max_dps_limits, [False, True]):
                 if not queue:
                     continue
-                cur_lim, cur_items = 0, self._next_api_payload["items"]
+                cur_lim, cur_tasks, cur_items = 0, self._next_tasks, self._next_api_payload["items"]
                 if cur_items:
                     # Tally up either raw or agg query limits:
                     cur_lim = sum(d["limit"] for d in cur_items if task_is_raw(d) is is_raw)
@@ -546,10 +564,12 @@ class DpsFetchOrchestrator:
                     if len(cur_items) + 1 > 100:
                         payload_at_max_items = True
                         break
-                    _, limit, _, next_task = queue[0]  # Highest pri task is always at index 0 (heap magic)
-                    if cur_lim + limit <= max_dps:
-                        cur_items.append(next_task)
-                        cur_lim += limit
+                    # Highest pri task is always at index 0 (heap magic):
+                    _, next_limit, _, next_task, next_payload = queue[0]
+                    if cur_lim + next_limit <= max_dps:
+                        cur_items.append(next_payload)
+                        cur_tasks.append(next_task)
+                        cur_lim += next_limit
                         heapq.heappop(queue)  # Pop to remove from heap
                     else:
                         payload_is_full[is_raw] = True
@@ -563,8 +583,8 @@ class DpsFetchOrchestrator:
                     or (return_partial_query and not any(self.queues))
                 )
                 if payload_done:
-                    queries.append(self._next_api_payload)
-                    self._next_api_payload = {"items": []}
+                    queries.append((cur_tasks, self._next_api_payload))
+                    self._next_tasks, self._next_api_payload = [], {"items": []}
                     break
         return queries
 
@@ -587,6 +607,7 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
                 future = pool.submit(dps_orchestrator.create_tasks_from_counts, qs_chunk, count_task_chunk)
                 futures_dct[future] = DpsTaskType.CREATE_TASKS
 
+        future_tasks_dct = {}
         while futures_dct:
             # Queue up new work as soon as possible by using `as_completed`:
             # TODO: Is this better than `wait(..., return_when=FIRST_COMPLETED)`?
@@ -594,7 +615,8 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             res, task_type = future.result(), futures_dct.pop(future)
 
             if task_type is DpsTaskType.DATAPOINTS:
-                new_tasks = dps_orchestrator.handle_fetched_new_dps(res)
+                tasks_in_res = future_tasks_dct.pop(future)
+                new_tasks = dps_orchestrator.handle_fetched_new_dps(tasks_in_res, res)
                 dps_orchestrator.queue_new_tasks(new_tasks)
 
             elif task_type is DpsTaskType.CREATE_TASKS:
@@ -609,6 +631,7 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
                 if qsize < 2 * max_workers:  # When pool queue has less than 2 awaiting tasks per worker
                     smol_query_ok = qsize < max(2, max_workers)  # Flush dps tasks in queues, even if < API limits
                     new_queries = dps_orchestrator.combine_tasks_into_new_queries(return_partial_query=smol_query_ok)
-                    for payload in new_queries:
+                    for tasks, payload in new_queries:
                         future = pool.submit(single_datapoints_api_call, client, payload)
                         futures_dct[future] = DpsTaskType.DATAPOINTS
+                        future_tasks_dct[future] = tasks
