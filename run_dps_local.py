@@ -28,10 +28,10 @@ EXTERNAL_ID = [
     # {"limit": None, "external_id": "ts-test-#01-daily-64/650"},
     # {"limit": None, "external_id": "ts-test-#01-daily-444/650"},
     # {"limit": None, "external_id": "8400074_destination"},  # string
-    {"limit": None, "external_id": "9624122_cargo_type"},  # string
+    {"limit": 15, "external_id": "9624122_cargo_type"},  # string
     {"limit": None, "external_id": "ts-test-#01-daily-651/650"},  # missing
 ]
-client = setup_local_cog_client()
+client = setup_local_cog_client(debug=False)
 query = NewDatapointsQuery(
     client=client.datapoints,
     start=START,

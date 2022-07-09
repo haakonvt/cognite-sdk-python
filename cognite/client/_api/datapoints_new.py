@@ -1,5 +1,5 @@
 from __future__ import annotations
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from pprint import pprint, pformat  # noqa
 import threading
 import math
@@ -335,22 +335,23 @@ def dps_fetch_strategy_selector(query: TSQuery, parallel: bool) -> BaseDpsTask:
     }[selector]
 
 
-# TODO: Normal (or abstract) class instead maybe? If python allows defining abstract dataclasses (easily)
-#       at some point, change this class:
-#       https://github.com/python/mypy/issues/5374
+# WORKAROUND: Python does not allow us to easily define abstract dataclasses
+class AbstractDpsTask(ABC):
+    @abstractmethod
+    def get_result(self, finalize):
+        ...
+
+
 @dataclass
-class BaseDpsTask:
+class BaseDpsTask(AbstractDpsTask):
     query: TSQuery
     client: DatapointsAPI
     is_done: bool = dataclasses.field(default=False, init=False)
     n_dps_fetched: int = dataclasses.field(default=0, init=False)
     dps_lsts: List[List[Union[Tuple, List[Tuple]]]] = dataclasses.field(default_factory=list, init=False)
 
-    @abstractmethod
-    def get_result(self, finalize):
-        ...
 
-
+@dataclass
 class RawDpsTask(BaseDpsTask):
     offset_next: int = dataclasses.field(default=1, init=False)
     unpack_fn: Callable[[str, str], Tuple[int, Union[str, float]]] = dataclasses.field(
@@ -358,7 +359,7 @@ class RawDpsTask(BaseDpsTask):
     )
 
 
-class SerialDpsTask(BaseDpsTask):
+class SerialDpsTask(AbstractDpsTask):
     def get_result(self, finalize=True):
         if self.is_done:
             res = itertools.chain.from_iterable(self.dps_lsts)
@@ -366,22 +367,25 @@ class SerialDpsTask(BaseDpsTask):
         raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
 
-class ParallelDpsTask(BaseDpsTask):
-    def get_result(self, finalize=True):
-        if self.is_done:
-            res = itertools.chain.from_iterable(
-                dps_task.get_result(finalize=False) for dps_task in self.dps_lsts
-            )
-            return list(res) if finalize else res
-        raise RuntimeError("Datapoints task asked for final result before fetching was done")
+# class ParallelDpsTask(AbstractDpsTask):
+#     def get_result(self, finalize=True):
+#         if self.is_done:
+#             res = itertools.chain.from_iterable(
+#                 dps_task.get_result(finalize=False) for dps_task in self.dps_lsts
+#             )
+#             return list(res) if finalize else res
+#         raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
 
-class RawSerialDpsTask(SerialDpsTask, RawDpsTask):
+@dataclass
+class RawSerialDpsTask(RawDpsTask, SerialDpsTask):
     """A raw datapoints fetching task for numeric and string data that executes in serial"""
 
     def __post_init__(self):
         self.is_first_query = True
         self.n_dps_left = self.query.limit
+        if self.n_dps_left is None:
+            self.n_dps_left = self.query._DPS_LIMIT
         self.next_start = self.query.start
         self.priority = 0  # TODO(haakonvt): Should be accepted as input arg
 
@@ -431,12 +435,12 @@ class RawSerialDpsTask(SerialDpsTask, RawDpsTask):
             self.is_done = True
 
 
-class RawParallelDpsTask(ParallelDpsTask):
-    """A raw datapoints fetching task for numeric and string data that executes in parallel"""
-
-    def foo(self):  # TODO(haakonvt): ...
-        self.offset_next = granularity_to_ms(self.query.granularity)
-        self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
+# class RawParallelDpsTask(ParallelDpsTask):
+#     """A raw datapoints fetching task for numeric and string data that executes in parallel"""
+#
+#     def foo(self):  # TODO(haakonvt): ...
+#         self.offset_next = granularity_to_ms(self.query.granularity)
+#         self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
 
 
 class DpsFetchOrchestrator:
@@ -447,6 +451,7 @@ class DpsFetchOrchestrator:
         # API queries can return up to max limit of aggregates AND max limit of raw dps independently:
         self.raw_pri_queue = []  # TODO: Consider queue.PriorityQueue
         self.agg_pri_queue = []  # TODO: Consider queue.PriorityQueue
+        self.queues = (self.agg_pri_queue, self.raw_pri_queue)
         self._next_api_payload = {"items": []}
         self._task_counter = itertools.count()  # Unique task counter and id
         self._task_lookup = {}  # Find tasks to mark e.g. "skip" if a limited query is finished early
@@ -498,13 +503,11 @@ class DpsFetchOrchestrator:
             tasks.extend(self.generate_string_ts_tasks(string_qs, self.client))
         if queries:
             tasks.extend(self.generate_ts_tasks(queries, counts_dps, self.client))
-
-        print("##################")
-        print(f"create_tasks_from_counts:\n{tasks = }")
         return tasks
 
     def handle_fetched_new_dps(self, res):
-        print("Function `handle_fetched_new_dps` got res:\n", res)
+        print("Function `handle_fetched_new_dps` got res:")
+        pprint(res)
         return []
 
     def queue_new_tasks(self, tasks):
@@ -513,7 +516,7 @@ class DpsFetchOrchestrator:
             if payload is None:
                 print(f"Function `queue_new_tasks` got a None task: {payload}. Skipping!")
                 continue
-            queue = (self.raw_pri_queue, self.agg_pri_queue)[task_is_raw(payload)]
+            queue = self.queues[task_is_raw(payload)]
             n = next(self._task_counter)
             # We leverage how tuples are compared to prioritise items. First `priority`, then `limit`
             # (to easily group smaller queries), then `counter` to always break ties (never use tasks themselves):
@@ -521,9 +524,7 @@ class DpsFetchOrchestrator:
             self._task_lookup[n] = payload
 
     def combine_tasks_into_new_queries(self, return_partial_query: bool = False):
-        """Returns the payload to get datapoints"""
-        queues = (self.agg_pri_queue, self.raw_pri_queue)
-        if not any(queues):
+        if not any(self.queues):
             cur_items = self._next_api_payload["items"]
             if return_partial_query and cur_items:
                 query, self._next_api_payload = self._next_api_payload, {"items": []}
@@ -532,9 +533,9 @@ class DpsFetchOrchestrator:
 
         queries = []
         max_dps_limits = (self._DPS_LIMIT_AGG, self._DPS_LIMIT)
-        while any(queues):  # As long as both not are empty
+        while any(self.queues):  # As long as both not are empty
             payload_at_max_items, payload_is_full = False, [False, False]
-            for queue, max_dps, is_raw in zip(queues, max_dps_limits, [False, True]):
+            for queue, max_dps, is_raw in zip(self.queues, max_dps_limits, [False, True]):
                 if not queue:
                     continue
                 cur_lim, cur_items = 0, self._next_api_payload["items"]
@@ -559,13 +560,12 @@ class DpsFetchOrchestrator:
                     or all(payload_is_full)
                     or (payload_is_full[1] and not self.agg_pri_queue)
                     or (payload_is_full[0] and not self.raw_pri_queue)
-                    or (return_partial_query and not any(queues))
+                    or (return_partial_query and not any(self.queues))
                 )
                 if payload_done:
-                    queries.append(cur_items)
-                    self._next_api_payload["items"] = []
+                    queries.append(self._next_api_payload)
+                    self._next_api_payload = {"items": []}
                     break
-
         return queries
 
 
