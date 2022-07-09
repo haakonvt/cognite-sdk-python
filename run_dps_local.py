@@ -46,4 +46,11 @@ query = NewDatapointsQuery(
 )
 q = query.all_validated_queries
 pprint(q)
-count_based_task_splitting(q, client, max_workers=1)
+finished_tasks = count_based_task_splitting(q, client, max_workers=1)
+print("#" * 40)
+print("#" * 40)
+print()
+pprint(finished_tasks)
+print()
+pprint([t.get_result() for t in finished_tasks])
+print()

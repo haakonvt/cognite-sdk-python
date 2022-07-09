@@ -514,31 +514,26 @@ class DpsFetchOrchestrator:
         return tasks
 
     def handle_fetched_new_dps(self, tasks, res):
-        print("Function `handle_fetched_new_dps` got res:")
         for task, r in zip(tasks, res):
+            # TODO: This assert is very defensive:
             assert r[task.query.identifier_type] == task.query.identifier, "Dps fetch failed"
             task.store_partial_result(r["datapoints"])
-            print(f"{task.is_done=}")
-            print(f"{task.get_result()=}")
-        input("enter to print datapoints")
-        pprint(res)
-        input("...")
-        return []
 
     def queue_new_tasks(self, new_tasks):
+        finished = []
         for task in new_tasks:
             priority, payload = task.get_next_task()
             if payload is None:
+                finished.append(task)
                 print(f"- Function `queue_new_tasks` got a None task: {payload}. Skipping!")
-                # self.tasks_done.add(self.tasks_running.remove(task))
                 continue
-            # self.tasks_running.add(task)
             queue = self.queues[task_is_raw(payload)]
             n = next(self._task_counter)
             # We leverage how tuples are compared to prioritise items. First `priority`, then `limit`
             # (to easily group smaller queries), then `counter` to always break ties (never use tasks themselves):
             heapq.heappush(queue, (priority, payload["limit"], n, task, payload))
             self._task_lookup[n] = payload
+        return finished
 
     def combine_tasks_into_new_queries(self, return_partial_query: bool = False):
         if not any(self.queues):
@@ -607,6 +602,7 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
                 future = pool.submit(dps_orchestrator.create_tasks_from_counts, qs_chunk, count_task_chunk)
                 futures_dct[future] = DpsTaskType.CREATE_TASKS
 
+        finished_tasks = []
         future_tasks_dct = {}
         while futures_dct:
             # Queue up new work as soon as possible by using `as_completed`:
@@ -615,15 +611,14 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             res, task_type = future.result(), futures_dct.pop(future)
 
             if task_type is DpsTaskType.DATAPOINTS:
-                tasks_in_res = future_tasks_dct.pop(future)
-                new_tasks = dps_orchestrator.handle_fetched_new_dps(tasks_in_res, res)
-                dps_orchestrator.queue_new_tasks(new_tasks)
+                grouped_tasks = future_tasks_dct.pop(future)
+                dps_orchestrator.handle_fetched_new_dps(grouped_tasks, res)
+                finished = dps_orchestrator.queue_new_tasks(grouped_tasks)
 
             elif task_type is DpsTaskType.CREATE_TASKS:
-                dps_orchestrator.queue_new_tasks(res)
-            else:
-                raise ValueError(f"Task type not understood, expected {DpsTaskType}, not {type(task_type)}")
+                finished = dps_orchestrator.queue_new_tasks(res)
 
+            finished_tasks.extend(finished)
             # Idk if lock needed, create tasks is very imporant
             with THREAD_LOCK:
                 # TODO: Play with these settings:
@@ -635,3 +630,4 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
                         future = pool.submit(single_datapoints_api_call, client, payload)
                         futures_dct[future] = DpsTaskType.DATAPOINTS
                         future_tasks_dct[future] = tasks
+    return finished_tasks
