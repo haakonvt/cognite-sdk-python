@@ -383,6 +383,7 @@ class RawSerialDpsTask(SerialDpsTask, RawDpsTask):
         self.is_first_query = True
         self.n_dps_left = self.query.limit
         self.next_start = self.query.start
+        self.priority = 0  # TODO(haakonvt): Should be accepted as input arg
 
     def _create_payload_item(self):
         return {
@@ -395,8 +396,8 @@ class RawSerialDpsTask(SerialDpsTask, RawDpsTask):
 
     def get_next_task(self):
         if self.is_done:
-            return None
-        return self._create_payload_item()
+            return None, None
+        return self.priority, self._create_payload_item()
 
     def store_partial_result(self, res):
         if not res:
@@ -444,19 +445,21 @@ class DpsFetchOrchestrator:
         self._DPS_LIMIT_AGG = client.datapoints._DPS_LIMIT_AGG
         self._DPS_LIMIT = client.datapoints._DPS_LIMIT
         # API queries can return up to max limit of aggregates AND max limit of raw dps independently:
-        self.raw_pri_queue = []
-        self.agg_pri_queue = []
+        self.raw_pri_queue = []  # TODO: Consider queue.PriorityQueue
+        self.agg_pri_queue = []  # TODO: Consider queue.PriorityQueue
         self._next_api_payload = {"items": []}
         self._task_counter = itertools.count()  # Unique task counter and id
         self._task_lookup = {}  # Find tasks to mark e.g. "skip" if a limited query is finished early
 
     @staticmethod
-    def generate_string_ts_tasks(queries):
-        print("- WARNING (simple implementation): all string TS will be fetched in serially...")
-        return [dps_fetch_strategy_selector(q, parallel=False) for q in queries]
+    def generate_string_ts_tasks(queries, client):
+        print("- WARNING (simple implementation): all string TS will be fetched in serially...")  # TODO(haakonvt)
+        return [
+            dps_fetch_strategy_selector(q, parallel=False)(q, client) for q in queries
+        ]
 
     @staticmethod
-    def generate_ts_tasks(queries, res):
+    def generate_ts_tasks(queries, res, client):
         tasks = []
         for q, r in zip(queries, res):
             assert r[q.identifier_type] == q.identifier, "Counts belong to wrong time series."
@@ -464,7 +467,9 @@ class DpsFetchOrchestrator:
             approx_tot = sum(dp["count"] for dp in counts)
             if approx_tot < q.max_query_limit:
                 # We are expecting a full fetch in a single request
-                tasks.append(dps_fetch_strategy_selector(q, parallel=False))
+                tasks.append(dps_fetch_strategy_selector(q, parallel=False)(q, client))
+            else:
+                print(f"- WARNING: Skipped ´generate_ts_tasks´ for: {q}")  # TODO(haakonvt)
         return tasks
 
     def get_available_counts(self, queries, count_query):
@@ -490,23 +495,30 @@ class DpsFetchOrchestrator:
         # Create dps fetch tasks for string first (since we cannot parallelize fetching cleverly with counts):
         tasks = []
         if string_qs:
-            tasks.extend(self.generate_string_ts_tasks(string_qs))
+            tasks.extend(self.generate_string_ts_tasks(string_qs, self.client))
         if queries:
-            tasks.extend(self.generate_ts_tasks(queries, counts_dps))
+            tasks.extend(self.generate_ts_tasks(queries, counts_dps, self.client))
 
-        tasks = list(itertools.zip_longest(tasks, [], fillvalue=DpsTaskType.DATAPOINTS))
         print("##################")
         print(f"create_tasks_from_counts:\n{tasks = }")
         return tasks
 
+    def handle_fetched_new_dps(self, res):
+        print("Function `handle_fetched_new_dps` got res:\n", res)
+        return []
+
     def queue_new_tasks(self, tasks):
-        for priority, task in tasks:
-            queue = (self.raw_pri_queue, self.agg_pri_queue)[task_is_raw(task)]
+        for task in tasks:
+            priority, payload = task.get_next_task()
+            if payload is None:
+                print(f"Function `queue_new_tasks` got a None task: {payload}. Skipping!")
+                continue
+            queue = (self.raw_pri_queue, self.agg_pri_queue)[task_is_raw(payload)]
             n = next(self._task_counter)
             # We leverage how tuples are compared to prioritise items. First `priority`, then `limit`
             # (to easily group smaller queries), then `counter` to always break ties (never use tasks themselves):
-            heapq.heappush(queue, (priority, task["limit"], n, task))
-            self._task_lookup[n] = task
+            heapq.heappush(queue, (priority, payload["limit"], n, payload))
+            self._task_lookup[n] = payload
 
     def combine_tasks_into_new_queries(self, return_partial_query: bool = False):
         """Returns the payload to get datapoints"""
@@ -557,34 +569,6 @@ class DpsFetchOrchestrator:
         return queries
 
 
-def combine_tasks_into_max_sized_queries(payload, max_items=100, max_dps=10_000):
-    chunk, n_items, n_dps = [], 0, 0
-    for item in payload.pop("items"):
-        try:
-            dps_limit = item["limit"]
-        except KeyError:
-            # If limit not given per item, we require default to exist:
-            dps_limit = payload["limit"]
-
-        if dps_limit is None:  # Note: 0 (falsy) is an allowed limit
-            dps_limit = max_dps
-
-        if n_items + 1 > max_items or n_dps + dps_limit > max_dps:
-            yield {**payload, "items": chunk}
-            chunk, n_items, n_dps = [], 0, 0
-        chunk.append(item)
-        n_items += 1
-        n_dps += dps_limit
-    if chunk:
-        yield {**payload, "items": chunk}
-
-
-
-
-
-
-
-
 def count_based_task_splitting(query_lst, client, max_workers=10):
     dps_orchestrator = DpsFetchOrchestrator(client)
     # Set up pool using `max_workers` using at least 1 thread:
@@ -599,6 +583,7 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             # Smash together as many of the count-aggregate requests as possible:
             for count_task_chunk in chunk_queries_to_allowed_limits(count_tasks):
                 qs_chunk = list(itertools.islice(qs_it, len(count_task_chunk["items"])))
+                # TODO(haakonvt): Split task creation into its own class:
                 future = pool.submit(dps_orchestrator.create_tasks_from_counts, qs_chunk, count_task_chunk)
                 futures_dct[future] = DpsTaskType.CREATE_TASKS
 
@@ -609,8 +594,9 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             res, task_type = future.result(), futures_dct.pop(future)
 
             if task_type is DpsTaskType.DATAPOINTS:
-                dps_orchestrator.handle_fetched_new_dps(res)
-                dps_orchestrator.queue_new_tasks(res)
+                new_tasks = dps_orchestrator.handle_fetched_new_dps(res)
+                dps_orchestrator.queue_new_tasks(new_tasks)
+
             elif task_type is DpsTaskType.CREATE_TASKS:
                 dps_orchestrator.queue_new_tasks(res)
             else:
@@ -620,9 +606,9 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             with THREAD_LOCK:
                 # TODO: Play with these settings:
                 qsize = pool._work_queue.qsize()  # From docs: approximate size of the queue
-                if qsize < 1.5 * max_workers + 1:
-                    new_queries = dps_orchestrator.combine_tasks_into_new_queries()
-
+                if qsize < 2 * max_workers:  # When pool queue has less than 2 awaiting tasks per worker
+                    smol_query_ok = qsize < max(2, max_workers)  # Flush dps tasks in queues, even if < API limits
+                    new_queries = dps_orchestrator.combine_tasks_into_new_queries(return_partial_query=smol_query_ok)
                     for payload in new_queries:
                         future = pool.submit(single_datapoints_api_call, client, payload)
                         futures_dct[future] = DpsTaskType.DATAPOINTS
