@@ -27,7 +27,7 @@ from cognite.client._api.datapoints_extra import (
     handle_missing_ts,
     remove_string_ts,
 )
-from cognite.client.utils._time import granularity_to_ms, timestamp_to_ms
+from cognite.client.utils._time import timestamp_to_ms
 from cognite.client.data_classes import DatapointsQuery
 from cognite.client.exceptions import CogniteAPIError
 from cognite.client.utils._auxiliary import to_camel_case
@@ -40,6 +40,7 @@ THREAD_LOCK = threading.Lock()
 
 # Notes list
 # - Union[int, float] is the same as `float`.
+# - Include outside can return MAX_LIM + 2... SDK caps at MAX_LIM
 
 # TODO list
 # - Should be a special method named "retrieve_string_datapoints"
@@ -323,14 +324,17 @@ def dps_fetch_strategy_selector(query: TSQuery, parallel: bool) -> BaseDpsTask:
     selector = (
         query.is_raw_query,
         parallel,
-        bool(query.is_string),  # Status is typically unknown, except where checked to be True
+        bool(query.is_string),  # Status is typically unknown, except when checked to be True
+        query.include_outside_points,
     )
     return {
-        # raw parall string
-        # (True, True, True): RawParallelDpsTask,
-        # (True, True, False): RawParallelDpsTask,
-        (True, False, True): RawSerialDpsTask,
-        (True, False, False): RawSerialDpsTask,
+        # Raw  ||     str   outside
+        (True, False, True, True): RawSerialOutsideDpsTask,
+        (True, False, False, True): RawSerialOutsideDpsTask,
+        (True, False, True, False): RawSerialInsideDpsTask,
+        (True, False, False, False): RawSerialInsideDpsTask,
+        # (True, True, True, False): RawParallelDpsTask,
+        # (True, True, False, False): RawParallelDpsTask,
         # (None, None, None, None): None,
     }[selector]
 
@@ -367,6 +371,14 @@ class SerialDpsTask(AbstractDpsTask):
         raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
 
+# class RawParallelDpsTask(ParallelDpsTask):
+#     """A raw datapoints fetching task for numeric and string data that executes in parallel"""
+#
+#     def foo(self):  # TODO(haakonvt): ...
+#         self.offset_next = granularity_to_ms(self.query.granularity)
+#         self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
+
+
 # class ParallelDpsTask(AbstractDpsTask):
 #     def get_result(self, finalize=True):
 #         if self.is_done:
@@ -378,14 +390,25 @@ class SerialDpsTask(AbstractDpsTask):
 
 
 @dataclass
-class RawSerialDpsTask(RawDpsTask, SerialDpsTask):
-    """A raw datapoints fetching task for numeric and string data that executes in serial"""
+class RawSerialOutsideDpsTask(RawDpsTask, SerialDpsTask):
+    """A datapoints fetching task for:
+    - Data type: String and numeric
+    - Aggregates: None (raw datapoints)
+    - Include outside values: Yes
+    - Logic: Serial (one chunk at the time)
+    """
 
     def __post_init__(self):
+        # Note to self: When fetching with outside points, the last dps in the query
+        # will be end or after end. This is very weird when using a lower limit than
+        # number of dps between end and start:
+        #    |start ----------- end>
+        # .   . . .. ..     .  .  ..  .   # dps
+        # .   . .                     .   # 4 dps returned if limit=2
         self.is_first_query = True
         self.n_dps_left = self.query.limit
         if self.n_dps_left is None:
-            self.n_dps_left = self.query._DPS_LIMIT
+            self.n_dps_left = math.inf
         self.next_start = self.query.start
         self.priority = 0  # TODO(haakonvt): Should be accepted as input arg
 
@@ -397,92 +420,165 @@ class RawSerialDpsTask(RawDpsTask, SerialDpsTask):
             **self.query.identifier_dct,
             "start": self.next_start,
             "end": self.query.end,
-            "includeOutsidePoints": self.query.include_outside_points,
+            "includeOutsidePoints": True,
             "limit": min(self.n_dps_left, self.query._DPS_LIMIT),
          }
 
     def get_next_task(self):
         if self.is_done:
+            print()
+            print("Task DONE")
+            print()
             return None, None
+        print()
+        print("Next payload")
+        pprint(self._create_payload_item())
         return self.priority, self._create_payload_item()
 
     def store_partial_result(self, res):
         if not res:
             self.is_done = True
             return
+        n_original = len(res)
+        print(f"\n{n_original=}")
 
         first_idx = 0
-        if self.query.include_outside_points and not self.is_first_query:
-            # For all queries -not the first-, we might need to chop off the first dp.
+        if not self.is_first_query:
+            self.is_first_query = False
+            # For all queries -not the first-, we need to chop off the first dp.
             start_ts = res[0]["timestamp"]
-            prev_last_ts = self.n_dps_fetched[-1][-1][0]  # Timestamp is first entry
+            prev_last_ts = self.dps_lsts[-1][-1][0]  # Timestamp is first entry
             if start_ts == prev_last_ts:
                 first_idx = 1
-        self.is_first_query = False
 
         last_idx = None
-        n_new_dps = len(res) - first_idx
+        n_new_dps = n_original - first_idx
+        # +2 because: p to one before + one after
         if self.n_dps_left < n_new_dps:
             last_idx = self.n_dps_left + first_idx
 
         if first_idx or last_idx:
-            # List slices copies the underlying ref. array; minor speedup using islice:
+            # Avoid slicing list (copies underlying ref. array); islice provides minor speedup:
             res = itertools.islice(res, first_idx, last_idx)
+        print(f"{first_idx=}, {last_idx=}")
         res = list(map(self.unpack_fn, res))
         self.dps_lsts.append(res)
 
-        self.next_start = res[-1][0] + self.offset_next
-        self.n_dps_fetched += len(res)
-        self.n_dps_left = min(0, self.n_dps_left - n_new_dps)
-        if not self.n_dps_left:
+        n, last_ts = len(res), res[-1][0]
+        self.next_start = last_ts + self.offset_next
+        self.n_dps_fetched += n  # Currently unused, but could be used for direct array init (need len)
+        self.n_dps_left = self.n_dps_left - n
+
+        task_is_done = (
+            not self.n_dps_left  # Due to using last_idx, we hit exact 0
+            or n_original < self.query._DPS_LIMIT  # Only way to know is when strictly less
+            or last_ts >= self.query.end  # Since end is exclusive, we got the last outside point
+        )
+        if task_is_done:
             self.is_done = True
 
 
-# class RawParallelDpsTask(ParallelDpsTask):
-#     """A raw datapoints fetching task for numeric and string data that executes in parallel"""
+@dataclass
+class RawSerialInsideDpsTask(RawDpsTask, SerialDpsTask):
+    """A datapoints fetching task for:
+    - Data type: String and numeric
+    - Aggregates: None (raw datapoints)
+    - Include outside values: No
+    - Logic: Serial (one chunk at the time)
+    """
+
+    def get_next_task(*a, **k):
+        raise NotImplementedError
 #
-#     def foo(self):  # TODO(haakonvt): ...
-#         self.offset_next = granularity_to_ms(self.query.granularity)
-#         self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
+#     def __post_init__(self):
+#         self.include_outside = False
+#         self.is_first_query = True
+#         self.n_dps_left = self.query.limit
+#         if self.n_dps_left is None:
+#             self.n_dps_left = math.inf
+#         self.next_start = self.query.start
+#         self.priority = 0  # TODO(haakonvt): Should be accepted as input arg
+#
+#     def __hash__(self):
+#         return id(self)  # We just need uniqueness
+#
+#     def _create_payload_item(self):
+#         return {
+#             **self.query.identifier_dct,
+#             "start": self.next_start,
+#             "end": self.query.end,
+#             "includeOutsidePoints": self.query.include_outside_points,
+#             "limit": min(self.n_dps_left, self.query._DPS_LIMIT),
+#          }
+#
+#     def get_next_task(self):
+#         if self.is_done:
+#             return None, None
+#         return self.priority, self._create_payload_item()
+#
+#     def store_partial_result(self, res):
+#         if not res:
+#             self.is_done = True
+#             return
+#         n_original = len(res)
+#
+#         first_idx = 0
+#         if self.query.include_outside_points and not self.is_first_query:
+#             # For all queries -not the first-, we might need to chop off the first dp.
+#             start_ts = res[0]["timestamp"]
+#             prev_last_ts = self.dps_lsts[-1][-1][0]  # Timestamp is first entry
+#             if start_ts == prev_last_ts:
+#                 first_idx = 1
+#         self.is_first_query = False
+#
+#         last_idx = None
+#         n_new_dps = len(res) - first_idx
+#         if self.n_dps_left < n_new_dps:
+#             last_idx = self.n_dps_left + first_idx
+#
+#         if first_idx or last_idx:
+#             # Avoid slicing list (copies underlying ref. array); islice provides minor speedup:
+#             res = itertools.islice(res, first_idx, last_idx)
+#         res = list(map(self.unpack_fn, res))
+#         self.dps_lsts.append(res)
+#
+#         n, last_dp_ts = len(res), res[-1][0]
+#         self.next_start = last_dp_ts + self.offset_next
+#         self.n_dps_fetched += n
+#         self.n_dps_left = self.n_dps_left - n
+#         # TODO(haakonvt): Fix this buggy mess
+#         if not self.n_dps_left:
+#             self.is_done = True
+#         elif n_original < self.query._DPS_LIMIT:  # Only way to know is when strictly less
+#             self.is_done = True
+#         elif self.query.include_outside_points:
+#             if last_dp_ts >= self.query.end:  # Since end is exclusive, we got the last outside point
+#                 self.is_done = True
 
 
-class DpsFetchOrchestrator:
+class DpsTaskCreator:
     def __init__(self, client):
         self.client = client
-        self._DPS_LIMIT_AGG = client.datapoints._DPS_LIMIT_AGG
-        self._DPS_LIMIT = client.datapoints._DPS_LIMIT
-        # API queries can return up to max limit of aggregates AND max limit of raw dps independently:
-        self.raw_pri_queue = []  # TODO: Consider queue.PriorityQueue
-        self.agg_pri_queue = []  # TODO: Consider queue.PriorityQueue
-        self.queues = (self.agg_pri_queue, self.raw_pri_queue)
-        # self.tasks_running = set()
-        # self.tasks_done = set()
-        # Queries with duplicated identifiers are allowed so we need to know exactly which fetched datapoints
-        # belong to which tasks:
-        self._next_tasks = []
-        self._next_api_payload = {"items": []}
-        self._task_counter = itertools.count()  # Unique task counter and id
-        self._task_lookup = {}  # Find tasks to mark e.g. "skip" if a limited query is finished early
 
-    @staticmethod
-    def generate_string_ts_tasks(queries, client):
+    def generate_string_ts_tasks(self, queries):
         print("- WARNING (simple implementation): all string TS will be fetched serially...")  # TODO(haakonvt)
         return [
-            dps_fetch_strategy_selector(q, parallel=False)(q, client) for q in queries
+            dps_fetch_strategy_selector(q, parallel=False)(q, self.client) for q in queries
         ]
 
-    @staticmethod
-    def generate_ts_tasks(queries, res, client):
+    def generate_ts_tasks(self, queries, res):
         tasks = []
         for q, r in zip(queries, res):
             assert r[q.identifier_type] == q.identifier, "Counts belong to wrong time series."
-            counts = r["datapoints"]
-            approx_tot = sum(dp["count"] for dp in counts)
-            if q.limit < q.max_query_limit or approx_tot < q.max_query_limit:
-                # We are expecting a full fetch in a single request
-                tasks.append(dps_fetch_strategy_selector(q, parallel=False)(q, client))
-            else:
-                print(f"- WARNING: Skipped ´generate_ts_tasks´ for: {q}")  # TODO(haakonvt)
+            tasks.append(dps_fetch_strategy_selector(q, parallel=False)(q, self.client))
+            continue
+            # counts = r["datapoints"]
+            # approx_tot = sum(dp["count"] for dp in counts)
+            # if q.limit is not None and q.limit < q.max_query_limit or approx_tot < q.max_query_limit:
+            #     # We are expecting a full fetch in a single request
+            #     tasks.append(dps_fetch_strategy_selector(q, parallel=False)(q, self.client))
+            # else:
+            #     print(f"- WARNING: Skipped ´generate_ts_tasks´ for: {q}")  # TODO(haakonvt)
         return tasks
 
     def get_available_counts(self, queries, count_query):
@@ -508,10 +604,29 @@ class DpsFetchOrchestrator:
         # Create dps fetch tasks for string first (since we cannot parallelize fetching cleverly with counts):
         tasks = []
         if string_qs:
-            tasks.extend(self.generate_string_ts_tasks(string_qs, self.client))
+            tasks.extend(self.generate_string_ts_tasks(string_qs))
         if queries:
-            tasks.extend(self.generate_ts_tasks(queries, counts_dps, self.client))
+            tasks.extend(self.generate_ts_tasks(queries, counts_dps))
         return tasks
+
+
+class DpsFetchOrchestrator:
+    def __init__(self, client):
+        self.client = client
+        self._DPS_LIMIT_AGG = client.datapoints._DPS_LIMIT_AGG
+        self._DPS_LIMIT = client.datapoints._DPS_LIMIT
+        # API queries can return up to max limit of aggregates AND max limit of raw dps independently:
+        self.raw_pri_queue = []  # TODO: Consider queue.PriorityQueue
+        self.agg_pri_queue = []  # TODO: Consider queue.PriorityQueue
+        self.queues = (self.agg_pri_queue, self.raw_pri_queue)
+        # self.tasks_running = set()
+        # self.tasks_done = set()
+        # Queries with duplicated identifiers are allowed so we need to know exactly which fetched datapoints
+        # belong to which tasks:
+        self._next_tasks = []
+        self._next_api_payload = {"items": []}
+        self._task_counter = itertools.count()  # Unique task counter and id
+        self._task_lookup = {}  # Find tasks to mark e.g. "skip" if a limited query is finished early
 
     def handle_fetched_new_dps(self, tasks, res):
         for task, r in zip(tasks, res):
@@ -525,7 +640,6 @@ class DpsFetchOrchestrator:
             priority, payload = task.get_next_task()
             if payload is None:
                 finished.append(task)
-                print(f"- Function `queue_new_tasks` got a None task: {payload}. Skipping!")
                 continue
             queue = self.queues[task_is_raw(payload)]
             n = next(self._task_counter)
@@ -586,6 +700,7 @@ class DpsFetchOrchestrator:
 
 def count_based_task_splitting(query_lst, client, max_workers=10):
     dps_orchestrator = DpsFetchOrchestrator(client)
+    dps_task_creator = DpsTaskCreator(client)
     # Set up pool using `max_workers` using at least 1 thread:
     assert max_workers > 0, f"Number of parallel workers threads must be at least one, not {max_workers=}"
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -599,7 +714,7 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             for count_task_chunk in chunk_queries_to_allowed_limits(count_tasks):
                 qs_chunk = list(itertools.islice(qs_it, len(count_task_chunk["items"])))
                 # TODO(haakonvt): Split task creation into its own class:
-                future = pool.submit(dps_orchestrator.create_tasks_from_counts, qs_chunk, count_task_chunk)
+                future = pool.submit(dps_task_creator.create_tasks_from_counts, qs_chunk, count_task_chunk)
                 futures_dct[future] = DpsTaskType.CREATE_TASKS
 
         finished_tasks = []
@@ -617,9 +732,9 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
 
             elif task_type is DpsTaskType.CREATE_TASKS:
                 finished = dps_orchestrator.queue_new_tasks(res)
-
             finished_tasks.extend(finished)
-            # Idk if lock needed, create tasks is very imporant
+
+            # Idk if lock needed(?), create tasks is very imporant
             with THREAD_LOCK:
                 # TODO: Play with these settings:
                 qsize = pool._work_queue.qsize()  # From docs: approximate size of the queue

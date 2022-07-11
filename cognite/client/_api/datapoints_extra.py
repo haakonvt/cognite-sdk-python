@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor
 # from timeit import default_timer as timer
 
@@ -10,13 +10,6 @@ from cognite.client.exceptions import CogniteNotFoundError
 print("RUNNING REPOS/COG-SDK, NOT FROM PIP")
 
 TIME_UNIT_IN_MS = {"s": 1000, "m": 60000, "h": 3600000, "d": 86400000}
-
-"""
-print(f"\nALL PARSED TS:\n {pformat(sorted({q.identifier_tpl for q in queries}), indent=4, width=135, sort_dicts=False)}")
-print(f"\nINFERRED STRING TS:\n{pformat(sorted({q.identifier_tpl for q in string_qs}), indent=4, width=135, sort_dicts=False)}")
-print(f"\nINFERRED MISSING TS:\n{pformat(sorted({q.identifier_tpl for q in missing}), indent=4, width=135, sort_dicts=False)}")
-print(f"\nAFTER REMOVING MISSING TS:\n{pformat(sorted({q.identifier_tpl for q in queries}), indent=4, width=135, sort_dicts=False)}")
-"""
 
 
 def align_window_start_and_end(start: int, end: int, granularity: str) -> Tuple[int, int]:
@@ -117,7 +110,7 @@ def handle_missing_ts(res, queries):
     # different settings for "ignore unknown":
     missing_to_raise = [q.identifier_dct for q in missing if q.is_missing and not q.ignore_unknown_ids]
     if missing_to_raise:
-        raise CogniteNotFoundError(not_found=missing)
+        raise CogniteNotFoundError(not_found=[m.identifier_dct for m in missing])
     return [q for q in queries if not q.is_missing], missing
 
 
@@ -135,16 +128,16 @@ def handle_string_ts(string_ts, queries):
 
 
 def get_is_string_property(client, queries):
-    # We do not know if duplicates exist between those given by `id` and `external_id`.
+    # Note 1: We do not know if duplicates exist between those given by `id` and `external_id`.
     # Quick fix is to send two separate queries ಠಿ_ಠ
     futures = []
-    # TODO(haakonvt): Dont really want another TPE inside here????:
-    # TODO(haakonvt): Chunk if number of time series is too large! (and change max_workers?)
     with ThreadPoolExecutor(max_workers=2) as pool:
         for identifier_type in ["id", "externalId"]:
             items = set(q.identifier for q in queries if q.identifier_type == identifier_type)
-            # Note: We do not call client.time_series.retrieve_multiple since it spins up
+            # Note 2: We do not call client.time_series.retrieve_multiple since it spins up
             # a separate thread pool:
+            # Note 3: We do not need to chunk the request for time series, as the number of queries is
+            # already chunked at maximum 1/10 the limits.
             future = pool.submit(
                 client.time_series._post,
                 url_path="/timeseries/byids",

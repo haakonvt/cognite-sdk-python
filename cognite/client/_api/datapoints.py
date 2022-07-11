@@ -19,7 +19,6 @@ class DatapointsAPI(APIClient):
 
     def __init__(self, *args, **kwargs):
         print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
-        print("RUNNING REPOS/COG-SDK, NOT FROM PIP\n")
         super().__init__(*args, **kwargs)
         self._DPS_LIMIT_AGG = 10_000
         self._DPS_LIMIT = 100_000
