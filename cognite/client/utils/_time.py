@@ -15,7 +15,7 @@ def datetime_to_ms(dt):
             "Interpreting given naive datetime as UTC instead of local time (Python default behaviour). "
             "This will change in the next major release. Please use (timezone) aware datetimes "
             "or pass an integer with number of milliseconds since epoch (leap seconds excluded).",
-            PendingDeprecationWarning,
+            FutureWarning,
         )
         dt = dt.replace(tzinfo=timezone.utc)
     return int(1000 * dt.timestamp())

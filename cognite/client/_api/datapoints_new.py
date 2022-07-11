@@ -1,13 +1,16 @@
 from __future__ import annotations
+
+from collections import defaultdict
 from abc import ABC, abstractmethod
 from pprint import pprint, pformat  # noqa
+import warnings
 import threading
 import math
 import numbers
 import heapq
 import operator as op
-from typing import List, Union, Optional, Dict, NoReturn, Tuple, Callable
-from functools import cached_property
+from typing import List, Union, DefaultDict, Optional, Dict, NoReturn, Tuple, Callable
+from functools import partial, cached_property
 from datetime import datetime
 import enum
 import dataclasses
@@ -27,7 +30,7 @@ from cognite.client._api.datapoints_extra import (
     handle_missing_ts,
     remove_string_ts,
 )
-from cognite.client.utils._time import timestamp_to_ms
+from cognite.client.utils._time import timestamp_to_ms, granularity_to_ms
 from cognite.client.data_classes import DatapointsQuery
 from cognite.client.exceptions import CogniteAPIError
 from cognite.client.utils._auxiliary import to_camel_case
@@ -192,6 +195,14 @@ class TSQuery:
         self._verify_time_range()
         self._verify_limit()
         self._verify_identifier()
+        if self.include_outside_points and self.limit is not None:
+            warnings.warn(
+                "When using `include_outside_points=True` with a non-infinite `limit` you may get "
+                "a large gap between the last 'inside datapoint' and the 'after/outside' datapoint. "
+                "Note also that the up-to-two outside points come in addition to your given `limit`; "
+                "asking for 5 datapoints might yield 5, 6 or 7. It's a feature, not a bug ;)",
+                UserWarning,
+            )
 
     def get_count_query_params(self):
         if self.is_raw_query:
@@ -315,34 +326,31 @@ class TSQuery:
         return f'{type(self).__name__}({s})'
 
 
-class DpsTaskType(enum.Enum):
-    CREATE_TASKS = enum.auto()
-    DATAPOINTS = enum.auto()
-
-
 def dps_fetch_strategy_selector(query: TSQuery, parallel: bool) -> BaseDpsTask:
-    selector = (
-        query.is_raw_query,
-        parallel,
-        bool(query.is_string),  # Status is typically unknown, except when checked to be True
-        query.include_outside_points,
-    )
-    return {
-        # Raw  ||     str   outside
-        (True, False, True, True): RawSerialOutsideDpsTask,
-        (True, False, False, True): RawSerialOutsideDpsTask,
-        (True, False, True, False): RawSerialInsideDpsTask,
-        (True, False, False, False): RawSerialInsideDpsTask,
-        # (True, True, True, False): RawParallelDpsTask,
-        # (True, True, False, False): RawParallelDpsTask,
-        # (None, None, None, None): None,
-    }[selector]
+    if query.is_raw_query:
+        selector = (parallel, query.include_outside_points)
+        strategy_dct = {
+            (False, False): RawSerialInsideDpsTask,
+            (False, True): RawSerialOutsideDpsTask,
+            (True, False): RawParallelInsideDpsTask,
+        }
+    else:
+        assert query.is_string is not True, "wtf, how this happen"
+        selector = (parallel, query.limit is None)
+        strategy_dct = {
+            (False, False): None,  # Serial unlimited agg query (TODO(haakonvt): Trivial)
+            (False, True): None,   # Serial limited agg query (TODO(haakonvt): Trivial)
+            (True, False): None,   # Parallel unlimited query (TODO(haakonvt): Easy)
+            (True, True): None,    # Parallel limited query (TODO(haakonvt): Hard)
+        }
+    # TODO(haakonvt): Fallback?
+    return strategy_dct[selector]
 
 
 # WORKAROUND: Python does not allow us to easily define abstract dataclasses
 class AbstractDpsTask(ABC):
     @abstractmethod
-    def get_result(self, finalize):
+    def get_result(self):
         ...
 
 
@@ -351,20 +359,20 @@ class BaseDpsTask(AbstractDpsTask):
     query: TSQuery
     client: DatapointsAPI
     is_done: bool = dataclasses.field(default=False, init=False)
-    # n_dps_fetched: int = dataclasses.field(default=0, init=False)
 
 
 # @dataclass
-# class ParallelBaseDpsTask(BaseDpsTask):
-#     pass
-#     # dps_lsts: List[List[Union[Tuple, List[Tuple]]]] = dataclasses.field(default_factory=list, init=False)
+# class AggDpsTask(BaseDpsTask):
+#     def __post_init__(self):
+#         self.offset_next = granularity_to_ms(self.query.granularity)
+#         self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)  # NB: timestamp must be first
 
 
 @dataclass
 class RawDpsTask(BaseDpsTask):
     priority: int = 0
-    dps_lst: List[Tuple] = dataclasses.field(default_factory=list, init=False)
     offset_next: int = dataclasses.field(default=1, init=False)
+    dps_lst: List[Tuple] = dataclasses.field(default_factory=list, init=False)
     unpack_fn: Callable[[str, str], Tuple[int, Union[str, float]]] = dataclasses.field(
         default=op.itemgetter("timestamp", "value"), init=False  # NB: timestamp must be first
     )
@@ -403,36 +411,83 @@ class RawDpsTask(BaseDpsTask):
 
 
 class SerialDpsTask(AbstractDpsTask):
-    def get_result(self, finalize=True):
-        del finalize  # needed for signature?
+    def get_result(self):
         if self.is_done:
             return self.dps_lst
-            # res = itertools.chain.from_iterable(self.dps_lsts)
-            # return list(res) if finalize else res
         raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
 
-# class RawParallelDpsTask(ParallelDpsTask):
-#     """A raw datapoints fetching task for numeric and string data that executes in parallel"""
-#
-#     def foo(self):  # TODO(haakonvt): ...
-#         self.offset_next = granularity_to_ms(self.query.granularity)
-#         self.unpack_fn = op.itemgetter("timestamp", *self.query.aggregates)
+@dataclass
+class ParallelDpsTask(AbstractDpsTask):
+    counts_dct: Dict
+    dps_task_lst: DefaultDict[RawDpsTask, List[Tuple]] = dataclasses.field(
+        default_factory=partial(defaultdict, list), init=False
+    )
+
+    def get_result(self):
+        if self.is_done:
+            raise RuntimeError("fix sorting of `dps_task_lst`")
+            return list(itertools.chain.from_iterable(dps_task.get_result() for dps_task in self.dps_task_lst))
+        raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
 
-# class ParallelDpsTask(AbstractDpsTask):
-#     def get_result(self, finalize=True):
-#         if self.is_done:
-#             res = itertools.chain.from_iterable(
-#                 dps_task.get_result(finalize=False) for dps_task in self.dps_lsts
-#             )
-#             return list(res) if finalize else res
-#         raise RuntimeError("Datapoints task asked for final result before fetching was done")
+@dataclass
+class RawParallelInsideDpsTask(BaseDpsTask, ParallelDpsTask):
+    """A datapoints fetching task:
+    - Data type: String and numeric
+    - Aggregates: None (raw datapoints)
+    - Include outside values: No
+    - Logic: Parallel fetch using count aggregates when available,
+             else splits time period uniformly. When given a limited
+             query, it sets priority lower for later time periods.
+    """
+
+    def __post_init__(self):
+        # Note to self, available:
+        # - query: TSQuery
+        # - client: DatapointsAPI
+        # - is_done: bool = dataclasses.field(default=False, init=False)
+        # - dps_task_lst: DefaultDict[RawDpsTask, List[Tuple]] = dataclasses.field(default_factory=partial(defaultdict, list), init=False)
+
+        # TODO(haakonvt): dps_task_lst --> jst be a list???
+        self.n_dps_left = self.query.limit
+        self.no_limit = self.query.limit is None
+        if self.no_limit:
+            self.n_dps_left = math.inf
+
+        if self.counts_dct is None:
+            # TODO(haakonvt): Return???
+            self.split_tasks = self.split_into_tasks_uniformly()
+            # for task in self.split_tasks:
+            #     dps_task_lst[]
+        else:
+            # self.split_tasks = self.split_into_tasks_using_counts()
+            raise NotImplementedError("Count aggs. cant be used yet")
+
+    def split_into_tasks_uniformly(self):
+        # We do not have count aggregates to rely on so we split uniformly:
+        if self.no_limit:
+            n = 20  # TODO(): How to find in a clever way? 2 x max_workers?
+            start, end = self.query.start, self.query.end
+            delta = round((end - start) / n)
+            periods = [min(end, start + delta * i) for i in range(n+1)]
+            # TODO: From Python 3.10, change to itertools.pairwise:
+            split_tasks = []
+            for period_start, period_end in zip(periods[:-1], periods[1:]):
+                sub_query = dataclasses.replace(  # This makes a shallow copy (yes)
+                    self.query,
+                    start=period_start,
+                    end=period_end,
+                )
+                split_tasks.append(RawSerialInsideDpsTask(sub_query, self.client))
+            return split_tasks
+
+        raise NotImplementedError("Split into tasks requires `limit=None`")
 
 
 @dataclass
 class RawSerialInsideDpsTask(RawDpsTask, SerialDpsTask):
-    """A datapoints fetching task for:
+    """A datapoints fetching task:
     - Data type: String and numeric
     - Aggregates: None (raw datapoints)
     - Include outside values: No
@@ -452,7 +507,7 @@ class RawSerialInsideDpsTask(RawDpsTask, SerialDpsTask):
 
 @dataclass
 class RawSerialOutsideDpsTask(RawDpsTask, SerialDpsTask):
-    """A datapoints fetching task for:
+    """A datapoints fetching task:
     - Data type: String and numeric
     - Aggregates: None (raw datapoints)
     - Include outside values: Yes
@@ -513,6 +568,30 @@ class RawSerialOutsideDpsTask(RawDpsTask, SerialDpsTask):
             return self.set_status_to_done()
 
 
+# @dataclass
+# class AggSerialDpsTask(AggDpsTask, SerialDpsTask):
+#     """A datapoints fetching task:
+#     - Data type: Numeric
+#     - Aggregates: Yes
+#     - Logic: Serial; one chunk at the time
+#     """
+#     def store_partial_result(self, res):
+#         if not res:
+#             self.is_done = True
+#             return
+#
+#         n = len(res)
+#         self.unpack_and_store(res)
+#         self.update_state_for_next_payload(n)
+#         if self.is_task_done(n):
+#             self.is_done = True
+
+
+class ParallelTaskEnum(enum.Enum):
+    CREATE_TASKS = enum.auto()
+    DATAPOINTS = enum.auto()
+
+
 class DpsTaskCreator:
     def __init__(self, client):
         self.client = client
@@ -526,7 +605,6 @@ class DpsTaskCreator:
     def generate_ts_tasks(self, queries, res):
         tasks = []
         for q, r in zip(queries, res):
-            assert r[q.identifier_type] == q.identifier, "Counts belong to wrong time series."
             tasks.append(dps_fetch_strategy_selector(q, parallel=False)(q, self.client))
             continue
             # counts = r["datapoints"]
@@ -576,8 +654,6 @@ class DpsFetchOrchestrator:
         self.raw_pri_queue = []  # TODO: Consider queue.PriorityQueue
         self.agg_pri_queue = []  # TODO: Consider queue.PriorityQueue
         self.queues = (self.agg_pri_queue, self.raw_pri_queue)
-        # self.tasks_running = set()
-        # self.tasks_done = set()
         # Queries with duplicated identifiers are allowed so we need to know exactly which fetched datapoints
         # belong to which tasks:
         self._next_tasks = []
@@ -672,7 +748,7 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
                 qs_chunk = list(itertools.islice(qs_it, len(count_task_chunk["items"])))
                 # TODO(haakonvt): Split task creation into its own class:
                 future = pool.submit(dps_task_creator.create_tasks_from_counts, qs_chunk, count_task_chunk)
-                futures_dct[future] = DpsTaskType.CREATE_TASKS
+                futures_dct[future] = ParallelTaskEnum.CREATE_TASKS
 
         finished_tasks = []
         future_tasks_dct = {}
@@ -682,12 +758,12 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
             future = next(as_completed(futures_dct))
             res, task_type = future.result(), futures_dct.pop(future)
 
-            if task_type is DpsTaskType.DATAPOINTS:
+            if task_type is ParallelTaskEnum.DATAPOINTS:
                 grouped_tasks = future_tasks_dct.pop(future)
                 dps_orchestrator.handle_fetched_new_dps(grouped_tasks, res)
                 finished = dps_orchestrator.queue_new_tasks(grouped_tasks)
 
-            elif task_type is DpsTaskType.CREATE_TASKS:
+            elif task_type is ParallelTaskEnum.CREATE_TASKS:
                 finished = dps_orchestrator.queue_new_tasks(res)
             finished_tasks.extend(finished)
 
@@ -700,6 +776,6 @@ def count_based_task_splitting(query_lst, client, max_workers=10):
                     new_queries = dps_orchestrator.combine_tasks_into_new_queries(return_partial_query=smol_query_ok)
                     for tasks, payload in new_queries:
                         future = pool.submit(single_datapoints_api_call, client, payload)
-                        futures_dct[future] = DpsTaskType.DATAPOINTS
+                        futures_dct[future] = ParallelTaskEnum.DATAPOINTS
                         future_tasks_dct[future] = tasks
     return finished_tasks
