@@ -31,7 +31,14 @@ EXTERNAL_ID = [
     # {"limit": None, "external_id": "ts-test-#01-daily-651/650"},  # missing
     {
         "include_outside_points": True,
-        "limit": 3,
+        "limit": 1,
+        "external_id": "ts-test-#04-ten-mill-dps-1/1",
+        "start": 31536472487-1,
+        "end": 31536698071+1,
+    },
+    {
+        "include_outside_points": False,
+        "limit": 1,
         "external_id": "ts-test-#04-ten-mill-dps-1/1",
         "start": 31536472487-1,
         "end": 31536698071+1,
@@ -54,16 +61,18 @@ q = query.all_validated_queries
 # pprint(q)
 finished_tasks = count_based_task_splitting(q, client, max_workers=1)
 res = [t.get_result() for t in finished_tasks]
-r0 = np.array(res[0])
-print(r0)
-print(f"{r0.shape=}")
-ts = r0[:, 0].astype(int)
-x = r0[:, 1]
-# print(f"{ts=}")
+for i, r in enumerate(res):
+    r = np.array(r)
+    print(r)
+    print(f"{r.shape=}")
+    ts = r[:, 0].astype(int)
+    x = r[:, 1]
+    # print(f"{ts=}")
 
-print("client.datapoints.retrieve(...):")
-print(
-    client.datapoints.retrieve(
-        **EXTERNAL_ID[0]
-    ).to_pandas()
-)
+    print("client.datapoints.retrieve(...):")
+    print(
+        client.datapoints.retrieve(
+            **EXTERNAL_ID[i]
+        ).to_pandas()
+    )
+    print()

@@ -351,23 +351,64 @@ class BaseDpsTask(AbstractDpsTask):
     query: TSQuery
     client: DatapointsAPI
     is_done: bool = dataclasses.field(default=False, init=False)
-    n_dps_fetched: int = dataclasses.field(default=0, init=False)
-    dps_lsts: List[List[Union[Tuple, List[Tuple]]]] = dataclasses.field(default_factory=list, init=False)
+    # n_dps_fetched: int = dataclasses.field(default=0, init=False)
+
+
+# @dataclass
+# class ParallelBaseDpsTask(BaseDpsTask):
+#     pass
+#     # dps_lsts: List[List[Union[Tuple, List[Tuple]]]] = dataclasses.field(default_factory=list, init=False)
 
 
 @dataclass
 class RawDpsTask(BaseDpsTask):
+    priority: int = 0
+    dps_lst: List[Tuple] = dataclasses.field(default_factory=list, init=False)
     offset_next: int = dataclasses.field(default=1, init=False)
     unpack_fn: Callable[[str, str], Tuple[int, Union[str, float]]] = dataclasses.field(
         default=op.itemgetter("timestamp", "value"), init=False  # NB: timestamp must be first
     )
 
+    def __post_init__(self):
+        self.n_dps_left = self.query.limit
+        if self.n_dps_left is None:
+            self.n_dps_left = math.inf
+        self.next_start = self.query.start
+
+    def __hash__(self):
+        return id(self)  # We just need uniqueness
+
+    def _create_payload_item(self):
+        return {
+            **self.query.identifier_dct,
+            "start": self.next_start,
+            "end": self.query.end,
+            "limit": min(self.n_dps_left, self.query._DPS_LIMIT),
+         }
+
+    def get_next_task(self):
+        if self.is_done:
+            return None, None
+        return self.priority, self._create_payload_item()
+
+    def unpack_and_store(self, res):
+        self.dps_lst.extend(map(self.unpack_fn, res))
+
+    def update_state_for_next_payload(self, n):
+        self.next_start = self.dps_lst[-1][0] + self.offset_next  # Move `start` to prepare for next query:
+        self.n_dps_left -= n
+
+    def is_task_done(self, n):
+        return self.n_dps_left == 0 or n < self.query._DPS_LIMIT or self.next_start == self.query.end
+
 
 class SerialDpsTask(AbstractDpsTask):
     def get_result(self, finalize=True):
+        del finalize  # needed for signature?
         if self.is_done:
-            res = itertools.chain.from_iterable(self.dps_lsts)
-            return list(res) if finalize else res
+            return self.dps_lst
+            # res = itertools.chain.from_iterable(self.dps_lsts)
+            # return list(res) if finalize else res
         raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
 
@@ -390,170 +431,86 @@ class SerialDpsTask(AbstractDpsTask):
 
 
 @dataclass
-class RawSerialOutsideDpsTask(RawDpsTask, SerialDpsTask):
-    """A datapoints fetching task for:
-    - Data type: String and numeric
-    - Aggregates: None (raw datapoints)
-    - Include outside values: Yes
-    - Logic: Serial (one chunk at the time)
-    """
-
-    def __post_init__(self):
-        # Note to self: When fetching with outside points, the last dps in the query
-        # will be end or after end. This is very weird when using a lower limit than
-        # number of dps between end and start:
-        #    |start ----------- end>
-        # .   . . .. ..     .  .  ..  .   # dps
-        # .   . .                     .   # 4 dps returned if limit=2
-        self.is_first_query = True
-        self.n_dps_left = self.query.limit
-        if self.n_dps_left is None:
-            self.n_dps_left = math.inf
-        self.next_start = self.query.start
-        self.priority = 0  # TODO(haakonvt): Should be accepted as input arg
-
-    def __hash__(self):
-        return id(self)  # We just need uniqueness
-
-    def _create_payload_item(self):
-        return {
-            **self.query.identifier_dct,
-            "start": self.next_start,
-            "end": self.query.end,
-            "includeOutsidePoints": True,
-            "limit": min(self.n_dps_left, self.query._DPS_LIMIT),
-         }
-
-    def get_next_task(self):
-        if self.is_done:
-            print()
-            print("Task DONE")
-            print()
-            return None, None
-        print()
-        print("Next payload")
-        pprint(self._create_payload_item())
-        return self.priority, self._create_payload_item()
-
-    def store_partial_result(self, res):
-        if not res:
-            self.is_done = True
-            return
-        n_original = len(res)
-        print(f"\n{n_original=}")
-
-        first_idx = 0
-        if not self.is_first_query:
-            self.is_first_query = False
-            # For all queries -not the first-, we need to chop off the first dp.
-            start_ts = res[0]["timestamp"]
-            prev_last_ts = self.dps_lsts[-1][-1][0]  # Timestamp is first entry
-            if start_ts == prev_last_ts:
-                first_idx = 1
-
-        last_idx = None
-        n_new_dps = n_original - first_idx
-        # +2 because: p to one before + one after
-        if self.n_dps_left < n_new_dps:
-            last_idx = self.n_dps_left + first_idx
-
-        if first_idx or last_idx:
-            # Avoid slicing list (copies underlying ref. array); islice provides minor speedup:
-            res = itertools.islice(res, first_idx, last_idx)
-        print(f"{first_idx=}, {last_idx=}")
-        res = list(map(self.unpack_fn, res))
-        self.dps_lsts.append(res)
-
-        n, last_ts = len(res), res[-1][0]
-        self.next_start = last_ts + self.offset_next
-        self.n_dps_fetched += n  # Currently unused, but could be used for direct array init (need len)
-        self.n_dps_left = self.n_dps_left - n
-
-        task_is_done = (
-            not self.n_dps_left  # Due to using last_idx, we hit exact 0
-            or n_original < self.query._DPS_LIMIT  # Only way to know is when strictly less
-            or last_ts >= self.query.end  # Since end is exclusive, we got the last outside point
-        )
-        if task_is_done:
-            self.is_done = True
-
-
-@dataclass
 class RawSerialInsideDpsTask(RawDpsTask, SerialDpsTask):
     """A datapoints fetching task for:
     - Data type: String and numeric
     - Aggregates: None (raw datapoints)
     - Include outside values: No
-    - Logic: Serial (one chunk at the time)
+    - Logic: Serial; one chunk at the time
+    """
+    def store_partial_result(self, res):
+        if not res:
+            self.is_done = True
+            return
+
+        n = len(res)
+        self.unpack_and_store(res)
+        self.update_state_for_next_payload(n)
+        if self.is_task_done(n):
+            self.is_done = True
+
+
+@dataclass
+class RawSerialOutsideDpsTask(RawDpsTask, SerialDpsTask):
+    """A datapoints fetching task for:
+    - Data type: String and numeric
+    - Aggregates: None (raw datapoints)
+    - Include outside values: Yes
+    - Logic: Serial; one chunk at the time
+
+    Note on using `include_outside_values=True`: the way the API returns data is to always return
+    the "outside points" if they exist - and up to whatever limit is set, (if set). This may cause
+    confusion since you might get an arbitrarily large gap between the last of the limited datapoints
+    returned - and the "outside point", the end.
+
+    An example query for `limit=2` datapoints to illustrate:
+       |start--------------end>     # Given start and end timestamps
+    .   . . .. ..     .  .  ..  .   # The raw datapoints
+    .   . .                     .   # The 4 datapoints returned
     """
 
-    def get_next_task(*a, **k):
-        raise NotImplementedError
-#
-#     def __post_init__(self):
-#         self.include_outside = False
-#         self.is_first_query = True
-#         self.n_dps_left = self.query.limit
-#         if self.n_dps_left is None:
-#             self.n_dps_left = math.inf
-#         self.next_start = self.query.start
-#         self.priority = 0  # TODO(haakonvt): Should be accepted as input arg
-#
-#     def __hash__(self):
-#         return id(self)  # We just need uniqueness
-#
-#     def _create_payload_item(self):
-#         return {
-#             **self.query.identifier_dct,
-#             "start": self.next_start,
-#             "end": self.query.end,
-#             "includeOutsidePoints": self.query.include_outside_points,
-#             "limit": min(self.n_dps_left, self.query._DPS_LIMIT),
-#          }
-#
-#     def get_next_task(self):
-#         if self.is_done:
-#             return None, None
-#         return self.priority, self._create_payload_item()
-#
-#     def store_partial_result(self, res):
-#         if not res:
-#             self.is_done = True
-#             return
-#         n_original = len(res)
-#
-#         first_idx = 0
-#         if self.query.include_outside_points and not self.is_first_query:
-#             # For all queries -not the first-, we might need to chop off the first dp.
-#             start_ts = res[0]["timestamp"]
-#             prev_last_ts = self.dps_lsts[-1][-1][0]  # Timestamp is first entry
-#             if start_ts == prev_last_ts:
-#                 first_idx = 1
-#         self.is_first_query = False
-#
-#         last_idx = None
-#         n_new_dps = len(res) - first_idx
-#         if self.n_dps_left < n_new_dps:
-#             last_idx = self.n_dps_left + first_idx
-#
-#         if first_idx or last_idx:
-#             # Avoid slicing list (copies underlying ref. array); islice provides minor speedup:
-#             res = itertools.islice(res, first_idx, last_idx)
-#         res = list(map(self.unpack_fn, res))
-#         self.dps_lsts.append(res)
-#
-#         n, last_dp_ts = len(res), res[-1][0]
-#         self.next_start = last_dp_ts + self.offset_next
-#         self.n_dps_fetched += n
-#         self.n_dps_left = self.n_dps_left - n
-#         # TODO(haakonvt): Fix this buggy mess
-#         if not self.n_dps_left:
-#             self.is_done = True
-#         elif n_original < self.query._DPS_LIMIT:  # Only way to know is when strictly less
-#             self.is_done = True
-#         elif self.query.include_outside_points:
-#             if last_dp_ts >= self.query.end:  # Since end is exclusive, we got the last outside point
-#                 self.is_done = True
+    def __post_init__(self):
+        super().__post_init__()
+        self.is_first_query = True
+        self.dp_outside_end = None
+        self.n_outside_points = 0
+
+    def get_next_task(self):
+        priority, payload = super().get_next_task()
+        if payload:
+            payload["includeOutsidePoints"] = self.is_first_query  # Only need to do this once
+        return priority, payload
+
+    def set_status_to_done(self):
+        if self.dp_outside_end is not None:
+            self.dps_lst.append(self.dp_outside_end)
+        self.is_done = True
+
+    def store_partial_result(self, res):
+        if not res:
+            return self.set_status_to_done()
+
+        n_orig = len(res)
+        if self.is_first_query:
+            # As part of the first query, we get up to 2 extra dps. We care mostly about the last
+            # as it might be "out-of-order":
+            first_dp, last_dp = res[0], res[-1]
+            if first_dp["timestamp"] < self.next_start:  # 'Next' is still from current request
+                # We got a dp before `start`, this should not impact our count towards `limit`:
+                self.n_outside_points = 1
+            if last_dp["timestamp"] >= self.query.end:  # >= because `end` is exclusive
+                self.dp_outside_end = self.unpack_fn(res.pop())  # Mutate list (pop) is faster than slicing
+                # self.n_outside_points += 0  # Zero...because we removed it!
+
+        self.unpack_and_store(res)
+        self.update_state_for_next_payload(len(res))
+        if self.is_first_query:
+            # Outside points does -not- count towards limit:
+            self.n_dps_left += self.n_outside_points
+            self.is_first_query = False
+
+        if self.is_task_done(n_orig):
+            return self.set_status_to_done()
 
 
 class DpsTaskCreator:
