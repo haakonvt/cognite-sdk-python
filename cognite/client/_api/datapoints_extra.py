@@ -130,14 +130,18 @@ def handle_string_ts(string_ts, queries):
 def get_is_string_property(client, queries):
     # Note 1: We do not know if duplicates exist between those given by `id` and `external_id`.
     # Quick fix is to send two separate queries ಠಿ_ಠ
-    futures = []
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        for identifier_type in ["id", "externalId"]:
-            items = set(q.identifier for q in queries if q.identifier_type == identifier_type)
-            # Note 2: We do not call client.time_series.retrieve_multiple since it spins up
-            # a separate thread pool:
-            # Note 3: We do not need to chunk the request for time series, as the number of queries is
-            # already chunked at maximum 1/10 the limits.
+    tasks = {}
+    for identifier_type in ["id", "externalId"]:
+        items = set(q.identifier for q in queries if q.identifier_type == identifier_type)
+        if items:
+            tasks[identifier_type] = items
+    # Note 2: We do not call client.time_series.retrieve_multiple since it spins up
+    # a separate thread pool:
+    # Note 3: We do not need to chunk the request for time series, as the number of queries is
+    # already chunked at maximum 1/10 the limits.
+    futures = {}
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:  # At most 2 workers
+        for identifier_type, items in tasks.items():
             future = pool.submit(
                 client.time_series._post,
                 url_path="/timeseries/byids",
@@ -146,11 +150,10 @@ def get_is_string_property(client, queries):
                     "ignoreUnknownIds": True
                 }
             )
-            futures.append(future)
-    return {
-        "id": {ts["id"] for ts in futures[0].result().json()["items"] if ts["isString"]},
-        "externalId": {ts["externalId"] for ts in futures[1].result().json()["items"] if ts["isString"]},
-    }
+            futures[identifier_type] = future
+    for identifier_type, future in futures.items():
+        futures[identifier_type] = {ts[identifier_type] for ts in future.result().json()["items"] if ts["isString"]}
+    return futures
 
 
 def remove_string_ts(client, queries, items):
