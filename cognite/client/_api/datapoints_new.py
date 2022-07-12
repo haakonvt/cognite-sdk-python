@@ -329,7 +329,7 @@ class TSQuery:
 
 def dps_fetch_strategy_selector(query: TSQuery, parallel: bool) -> BaseDpsTask:
     if query.is_raw_query:
-        selector = (parallel, query.include_outside_points)
+        selector = (parallel, bool(query.include_outside_points))
         strategy_dct = {
             (False, False): RawSerialInsideDpsTask,
             (False, True): RawSerialOutsideDpsTask,
@@ -355,13 +355,15 @@ class AbstractDpsTask(ABC):
         ...
 
 
-@dataclass
+# Note on `@dataclass(eq=False)`: We need all tasks to be hashable and guaranteed unique, even two exactly
+# similar tasks. With `eq=False`, we inherit __hash__ from `object` (just id(self)) - exactly what we want!
+@dataclass(eq=False)
 class BaseDpsTask(AbstractDpsTask):
     query: TSQuery
     client: DatapointsAPI
 
 
-# @dataclass
+# @dataclass(eq=False)
 # class AggDpsTask(BaseDpsTask):
 #     def __post_init__(self):
 #         self.offset_next = granularity_to_ms(self.query.granularity)
@@ -369,7 +371,7 @@ class BaseDpsTask(AbstractDpsTask):
 #         self.unpack_fn = op.itemgetter("timestamp", *map(to_camel_case, self.query.aggregates))
 
 
-@dataclass
+@dataclass(eq=False)
 class RawDpsTask(BaseDpsTask):
     priority: int
     parent_task: Optional[ParallelDpsTask] = None
@@ -418,7 +420,7 @@ class SerialDpsTask(AbstractDpsTask):
         raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
 
-@dataclass
+@dataclass(eq=False)
 class ParallelDpsTask(AbstractDpsTask):
     counts_dct: Dict
     subtasks: List[RawDpsTask] = dataclasses.field(default_factory=list, init=False)
@@ -429,30 +431,25 @@ class ParallelDpsTask(AbstractDpsTask):
         raise RuntimeError("Datapoints task asked for final result before fetching was done")
 
 
-@dataclass
+@dataclass(eq=False)
 class RawParallelInsideDpsTask(BaseDpsTask, ParallelDpsTask):
     """A datapoints fetching task:
     - Data type: String and numeric
     - Aggregates: None (raw datapoints)
     - Include outside values: No
-    - Logic: Parallel fetch using count aggregates when available,
-             else splits time period uniformly. When given a limited
-             query, it sets fetch-priority lower for later time periods
-             to increase possibility of quitting early.
+    - Logic: Parallel fetch using count aggregates when available, else splits time period uniformly.
+             When given a limited query, it sets fetch-priority lower for later time periods to
+             decrease possibility of fetching unneeded datapoints.
     """
-    def __hash__(self):  # TODO: Dataclass makes inheritance not work (gets overwritten)
-        return id(self)  # We just need uniqueness
-
     def __post_init__(self):
         self.n_dps_left = self.query.limit
         self.no_limit = self.query.limit is None
         if self.no_limit:
             self.n_dps_left = math.inf
-        # TODO: Check what client is passed in:
+        # TODO: Check what client is passed in (this is just hilarious):
         self.max_workers = self.client.datapoints._cognite_client.config.max_workers
 
         if self.counts_dct is None:
-            # TODO(haakonvt): How to tell dps_orchestrator about tasks?
             self._split_into_tasks_uniformly()
         else:
             # self.subtasks = self.split_into_tasks_using_counts()
@@ -461,13 +458,12 @@ class RawParallelInsideDpsTask(BaseDpsTask, ParallelDpsTask):
 
     @property
     def is_done(self):
-        print("is_done:", [t.is_done for t in self.subtasks])
         return all(t.is_done for t in self.subtasks)
 
     def _split_into_tasks_uniformly(self):
         # We do not have count aggregates to rely on so we split uniformly:
         if self.no_limit:
-            n = max(2, 2*self.client.datapoints._cognite_client.config.max_workers)
+            n = max(2, 2*self.max_workers)
             start, end = self.query.start, self.query.end
             tot_time = end - start
             # It makes no sense to split beyond what the max-size of a query allows:
@@ -487,7 +483,7 @@ class RawParallelInsideDpsTask(BaseDpsTask, ParallelDpsTask):
             raise NotImplementedError("Split into tasks requires `limit=None` for the time being")
 
 
-@dataclass
+@dataclass(eq=False)
 class RawSerialInsideDpsTask(RawDpsTask, SerialDpsTask):
     """A datapoints fetching task:
     - Data type: String and numeric
@@ -495,9 +491,6 @@ class RawSerialInsideDpsTask(RawDpsTask, SerialDpsTask):
     - Include outside values: No
     - Logic: Serial; one chunk at the time
     """
-    def __hash__(self):  # TODO: Dataclass makes inheritance not work (gets overwritten)
-        return id(self)  # We just need uniqueness
-
     def store_partial_result(self, res):
         if not res:
             self.is_done = True
@@ -510,7 +503,7 @@ class RawSerialInsideDpsTask(RawDpsTask, SerialDpsTask):
             self.is_done = True
 
 
-@dataclass
+@dataclass(eq=False)
 class RawSerialOutsideDpsTask(RawDpsTask, SerialDpsTask):
     """A datapoints fetching task:
     - Data type: String and numeric
@@ -528,10 +521,6 @@ class RawSerialOutsideDpsTask(RawDpsTask, SerialDpsTask):
     .   . . .. ..     .  .  ..  .   # The raw datapoints
     .   . .                     .   # The 4 datapoints returned
     """
-
-    def __hash__(self):  # TODO: Dataclass makes inheritance not work (gets overwritten)
-        return id(self)  # We just need uniqueness
-
     def __post_init__(self):
         super().__post_init__()
         self.is_first_query = True
@@ -709,7 +698,6 @@ class DpsFetchOrchestrator:
 
         for p_task in parallel_maybe_finished:
             if p_task.is_done:
-                print(f"{p_task.is_done=}")
                 finished.append(task)
         return finished
 

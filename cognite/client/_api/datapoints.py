@@ -1079,7 +1079,7 @@ class DatapointsFetcher:
             "ignoreUnknownIds": task.ignore_unknown_ids,
             "limit": min(window.limit, task.request_limit),
         }
-        pprint(payload)
+        # pprint(payload)
         res = self.client._post(self.client._RESOURCE_PATH + "/list", json=payload).json()["items"]
         if not res and task.ignore_unknown_ids:
             return task.mark_missing()

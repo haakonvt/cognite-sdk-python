@@ -11,7 +11,7 @@ from cognite.client._api.datapoints_new import count_based_task_splitting
 # specify an empty string to get raw data.
 START = None
 END = None
-LIMIT = None
+LIMIT = 1000
 AGGREGATES = None  # ["average"]
 GRANULARITY = None  # "12h"
 INCLUDE_OUTSIDE_POINTS = None
@@ -41,18 +41,23 @@ EXTERNAL_ID = [
     #     "include_outside_points": False,
     #     "limit": 100_000,
     #     "external_id": "8400074_destination",
-    #     "start": 1533945852000-1,
+    #     "start": 0,  # 1533945852000-1,
     #     "end": "now",  # 1533945852000+1,
     # },
-    {
-        "include_outside_points": False,
-        "limit": None,
-        "external_id": "ts-test-#04-ten-mill-dps-1/1",
-        "start": 31536472487-1,
-        "end": 2*31536698071+1,
-    },
+    # {
+    #     "include_outside_points": False,
+    #     "limit": None,
+    #     "external_id": "ts-test-#04-ten-mill-dps-1/1",
+    #     "start": 31536472487-1,
+    #     "end": 2*31536698071+1,
+    # },
 ]
-client = setup_local_cog_client(debug=False)
+EXTERNAL_ID = [
+    f"ts-test-#01-daily-{i}/650" for i in range(1, 301)
+]
+
+max_workers = 10
+client = setup_local_cog_client(max_workers, debug=False)
 query = NewDatapointsQuery(
     client=client.datapoints,
     start=START,
@@ -67,26 +72,31 @@ query = NewDatapointsQuery(
 )
 q = query.all_validated_queries
 # pprint(q)
-max_workers = 5
 t0 = timer()
 finished_tasks = count_based_task_splitting(q, client, max_workers=max_workers)
 t1 = timer()
 res = [t.get_result() for t in finished_tasks]
 tot_dp = sum(map(len, res))
-for i, r in enumerate(res):
-    r = np.array(r)
-    print(r)
-    print(f"{r.shape=}")
-    ts = r[:, 0].astype(int)
-    x = r[:, 1]
-    # print(f"{ts=}")
-    # print("client.datapoints.retrieve(...):")
-    # print(
-    #     client.datapoints.retrieve(
-    #         **EXTERNAL_ID[i]
-    #     ).to_pandas()
-    # )
-    print()
-t_tot = t1 - t0
+r = np.array(res)
+# print(r)
+print(f"{r.shape=}")
+# ts = r[:, 0].astype(int)
+
+t0_sdk = timer()
+res_sdk = client.datapoints.retrieve(
+    # **EXTERNAL_ID[0]
+    start=START or 0,
+    end=END or "now",
+    external_id=EXTERNAL_ID,
+    limit=LIMIT,
+)
+t1_sdk = timer()
+print(res_sdk.to_pandas())
+print()
+secs = input("how many secs?")
+t_tot = t1 - t0 - float(secs)
 dps_dps = round(tot_dp / t_tot, 2)
-print(f"N tasks finished: {len(finished_tasks)} in {round(t_tot, 6)} secs, dps/sec {dps_dps} using {max_workers=}")
+print(f"ME : N tasks: {len(finished_tasks)} in {round(t_tot, 6)} secs, dps/sec {dps_dps} using {max_workers=}")
+t_tot_sdk = t1_sdk - t0_sdk
+dps_dps_sdk = round(tot_dp / t_tot_sdk, 2)
+print(f"SDK: N tasks: {len(finished_tasks)} in {round(t_tot_sdk, 6)} secs, dps/sec {dps_dps_sdk} using max_workers={client.config.max_workers}")
